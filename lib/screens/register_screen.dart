@@ -25,6 +25,7 @@ class _WsRegisterScreenState extends State<WsRegisterScreen> {
       final res = await Supabase.instance.client.auth.signUp(
         email: _email.text.trim(),
         password: _password.text,
+        emailRedirectTo: 'https://watersuppliersaas.vercel.app/',
       );
       
       if (res.user != null) {
