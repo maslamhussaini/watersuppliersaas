@@ -1,3 +1,68 @@
 {
-    "cmake.sourceDirectory": "D:/Projects/flutter/watersuppliersaas/windows"
+    "cmake.sourceDirectory": "D:/Projects/flutter/watersuppliersaas/windows",
+    "chat.tools.terminal.autoApprove": {
+        "flutter": true,
+        "ForEach-Object": true,
+        "/^cd d:\\\\Projects\\\\flutter\\\\watersuppliersaas\\\\build\\\\web ; python -m http\\.server 8000$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cd d:\\\\Projects\\\\flutter\\\\watersuppliersaas\\\\build\\\\web ; python -m http\\.server 8081$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cd d:\\\\Projects\\\\flutter\\\\watersuppliersaas ; python - <<'PY'\nimport os, re, json, urllib\\.request, urllib\\.error\nfrom pathlib import Path\ntext = Path\\('\\.env'\\)\\.read_text\\(\\)\nurl = re\\.search\\(r\"SUPABASE_URL='\\(\\[\\^'\\]\\+\\)'\", text\\)\\.group\\(1\\)\nkey = re\\.search\\(r\"SUPABASE_ANON_KEY='\\(\\[\\^'\\]\\+\\)'\", text\\)\\.group\\(1\\)\nfor name, endpoint in \\[\n    \\('auth_health', url \\+ '/auth/v1/health'\\),\n    \\('rest_org_probe', url \\+ '/rest/v1/ws_tblOrganization\\?select=OrgID&limit=1'\\)\n\\]:\n    req = urllib\\.request\\.Request\\(endpoint, headers=\\{\n        'apikey': key,\n        'Authorization': f'Bearer \\{key\\}',\n        'Accept': 'application/json',\n    \\}\\)\n    try:\n        with urllib\\.request\\.urlopen\\(req, timeout=20\\) as resp:\n            body = resp\\.read\\(200\\)\\.decode\\('utf-8', 'ignore'\\)\n            print\\(name, 'HTTP', resp\\.status\\)\n            print\\(body\\[:300\\]\\)\n    except urllib\\.error\\.HTTPError as e:\n        print\\(name, 'HTTP', e\\.code\\)\n        print\\(e\\.read\\(300\\)\\.decode\\('utf-8', 'ignore'\\)\\)\n    except Exception as e:\n        print\\(name, 'ERROR', repr\\(e\\)\\)\nPY$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cd d:\\\\Projects\\\\flutter\\\\watersuppliersaas ; python - <<'PY'\nimport os, re, json, urllib\\.request, urllib\\.parse, urllib\\.error\nfrom pathlib import Path\ntext = Path\\('\\.env'\\)\\.read_text\\(\\)\nurl = re\\.search\\(r\"SUPABASE_URL='\\(\\[\\^'\\]\\+\\)'\", text\\)\\.group\\(1\\)\nkey = re\\.search\\(r\"SUPABASE_ANON_KEY='\\(\\[\\^'\\]\\+\\)'\", text\\)\\.group\\(1\\)\nheaders = \\{'apikey': key, 'Authorization': f'Bearer \\{key\\}', 'Accept': 'application/json'\\}\n\nbase = url\\.rstrip\\('/'\\) \\+ '/rest/v1'\n\ndef fetch\\(path, params=None\\):\n    if params:\n        path \\+= '\\?' \\+ urllib\\.parse\\.urlencode\\(params\\)\n    req = urllib\\.request\\.Request\\(path, headers=headers\\)\n    try:\n        with urllib\\.request\\.urlopen\\(req, timeout=20\\) as resp:\n            body = resp\\.read\\(\\)\\.decode\\('utf-8'\\)\n            print\\(f'URL: \\{path\\}\\\\nSTATUS: \\{resp\\.status\\}\\\\nBODY: \\{body\\[:2000\\]\\}\\\\n'\\)\n    except urllib\\.error\\.HTTPError as e:\n        print\\(f'URL: \\{path\\}\\\\nERROR: \\{e\\.code\\}\\\\n\\{e\\.read\\(2000\\)\\.decode\\(\"utf-8\", \"ignore\"\\)\\}\\\\n'\\)\n    except Exception as e:\n        print\\(f'URL: \\{path\\}\\\\nEXC: \\{e!r\\}\\\\n'\\)\n\n# Try metadata access\nfetch\\(base \\+ '/information_schema\\.columns', \\{'select': 'table_name,column_name', 'table_schema': 'public', 'limit': 50\\}\\)\nPY$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cd d:\\\\Projects\\\\flutter\\\\watersuppliersaas ; python -c \"import re, urllib\\.request, urllib\\.parse, urllib\\.error; from pathlib import Path; text = Path\\('\\.env'\\)\\.read_text\\(\\); url = re\\.search\\(r\\\\\"SUPABASE_URL='\\(\\[\\^'\\]\\+\\)'\\\\\", text\\)\\.group\\(1\\); key = re\\.search\\(r\\\\\"SUPABASE_ANON_KEY='\\(\\[\\^'\\]\\+\\)'\\\\\", text\\)\\.group\\(1\\); headers = \\{'apikey': key, 'Authorization': f'Bearer \\{key\\}', 'Accept': 'application/json'\\}; base = url\\.rstrip\\('/'\\) \\+ '/rest/v1'; path = base \\+ '/information_schema\\.columns' \\+ '\\?' \\+ urllib\\.parse\\.urlencode\\(\\{'select': 'table_name,column_name', 'table_schema': 'public', 'limit': 50\\}\\); req = urllib\\.request\\.Request\\(path, headers=headers\\); print\\('URL:', path\\);\n    with urllib\\.request\\.urlopen\\(req, timeout=20\\) as resp:\n        body = resp\\.read\\(\\)\\.decode\\('utf-8'\\)\n        print\\('STATUS:', resp\\.status\\)\n        print\\(body\\[:2000\\]\\)\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "Set-Content": true,
+        "/^cd d:\\\\Projects\\\\flutter\\\\watersuppliersaas ; \\$script = @'\nimport re, urllib\\.request, urllib\\.parse, urllib\\.error\nfrom pathlib import Path\ntext = Path\\('\\.env'\\)\\.read_text\\(\\)\nurl = re\\.search\\(r\"SUPABASE_URL='\\(\\[\\^'\\]\\+\\)'\", text\\)\\.group\\(1\\)\nkey = re\\.search\\(r\"SUPABASE_ANON_KEY='\\(\\[\\^'\\]\\+\\)'\", text\\)\\.group\\(1\\)\nheaders = \\{'apikey': key, 'Authorization': f'Bearer \\{key\\}', 'Accept': 'application/json'\\}\nbase = url\\.rstrip\\('/'\\) \\+ '/rest/v1'\nfor name in \\['ws_tblorganization','ws_tblinternalusers','ws_tblareas','ws_tblcustomers','ws_tbldeliveries','ws_tblpayments','ws_tblbottleinventories','vw_ws_customerbalance'\\]:\n    path = base \\+ '/' \\+ name \\+ '\\?select=\\*&limit=1'\n    req = urllib\\.request\\.Request\\(path, headers=headers\\)\n    print\\('QUERY', name\\)\n    try:\n        with urllib\\.request\\.urlopen\\(req, timeout=20\\) as resp:\n            print\\('STATUS', resp\\.status\\)\n            data = resp\\.read\\(2000\\)\\.decode\\('utf-8'\\)\n            print\\(data\\)\n    except urllib\\.error\\.HTTPError as e:\n        print\\('ERROR', e\\.code\\)\n        print\\(e\\.read\\(2000\\)\\.decode\\('utf-8','ignore'\\)\\)\n    except Exception as e:\n        print\\('EXC', repr\\(e\\)\\)\n'@\nSet-Content -LiteralPath \\.\\\\probe_supabase\\.py -Value \\$script -Encoding UTF8\npython \\.\\\\probe_supabase\\.py\nRemove-Item \\.\\\\probe_supabase\\.py$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^python probe_supabase\\.py$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cd d:\\\\Projects\\\\flutter\\\\watersuppliersaas ; python - <<'PY'\nimport re, urllib\\.request, urllib\\.parse, urllib\\.error\nfrom pathlib import Path\nimport json\ntext = Path\\('\\.env'\\)\\.read_text\\(\\)\nurl = re\\.search\\(r\"SUPABASE_URL='\\(\\[\\^'\\]\\+\\)'\", text\\)\\.group\\(1\\)\nkey = re\\.search\\(r\"SUPABASE_ANON_KEY='\\(\\[\\^'\\]\\+\\)'\", text\\)\\.group\\(1\\)\nheaders = \\{'apikey': key, 'Authorization': f'Bearer \\{key\\}', 'Accept': 'application/json'\\}\nbase = url\\.rstrip\\('/'\\) \\+ '/rest/v1/information_schema\\.columns'\nnames = \\['ws_tblorganization','ws_tblinternalusers','ws_tblareas','ws_tblcustomers','ws_tbldeliveries','ws_tblpayments','ws_tblbottleinventory','vw_ws_customerbalance'\\]\nparams = \\{\n    'select': 'table_name,column_name,ordinal_position',\n    'table_schema': 'public',\n    'table_name': 'in\\.\\(\\{\\}\\)'\\.format\\(','\\.join\\(names\\)\\)\n\\}\npath = base \\+ '\\?' \\+ urllib\\.parse\\.urlencode\\(params\\)\nreq = urllib\\.request\\.Request\\(path, headers=headers\\)\nprint\\('URL', path\\)\nwith urllib\\.request\\.urlopen\\(req, timeout=20\\) as resp:\n    body = resp\\.read\\(\\)\\.decode\\('utf-8'\\)\n    print\\('STATUS', resp\\.status\\)\n    print\\(body\\)\nPY$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^python query_supabase_columns\\.py$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cd d:\\\\Projects\\\\flutter\\\\watersuppliersaas ; python - <<'PY'\nimport re, urllib\\.request\nfrom pathlib import Path\n\ntext = Path\\('\\.env'\\)\\.read_text\\(\\)\nurl = re\\.search\\(r\"SUPABASE_URL='\\(\\[\\^'\\]\\+\\)'\", text\\)\\.group\\(1\\)\nkey = re\\.search\\(r\"SUPABASE_ANON_KEY='\\(\\[\\^'\\]\\+\\)'\", text\\)\\.group\\(1\\)\nheaders = \\{'apikey': key, 'Authorization': f'Bearer \\{key\\}', 'Accept': 'application/json'\\}\nroot = url\\.rstrip\\('/'\\) \\+ '/rest/v1/'\nprint\\('URL', root\\)\nreq = urllib\\.request\\.Request\\(root, headers=headers\\)\nwith urllib\\.request\\.urlopen\\(req, timeout=20\\) as resp:\n    print\\('STATUS', resp\\.status\\)\n    print\\(resp\\.read\\(20000\\)\\.decode\\('utf-8'\\)\\)\nPY$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^python list_supabase_resources\\.py$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^python query_columns_by_table\\.py$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^python test_supabase_field_cases\\.py$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^python check_ws_tables\\.py$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cd d:\\\\Projects\\\\flutter\\\\watersuppliersaas ; python - <<'PY'\nimport re, urllib\\.request, urllib\\.error\nfrom pathlib import Path\ntext = Path\\('\\.env'\\)\\.read_text\\(\\)\nurl = re\\.search\\(r\"SUPABASE_URL='\\(\\[\\^'\\]\\+\\)'\", text\\)\\.group\\(1\\)\nkey = re\\.search\\(r\"SUPABASE_ANON_KEY='\\(\\[\\^'\\]\\+\\)'\", text\\)\\.group\\(1\\)\nheaders = \\{'apikey': key, 'Authorization': f'Bearer \\{key\\}', 'Accept': 'application/json'\\}\nfor table in \\['ws_tblorganization','ws_tblinternalusers','ws_tblareas','ws_tblcustomers','ws_tbldeliveries','ws_tblpayments','ws_tblbottleinventory','vw_ws_customerbalance'\\]:\n    for col in \\['authuserid','orgid','role','fullname','areaname','rateperbottle','customerid','areaid','deliverydate','paymentdate','snapshotdate','bottlebalance','outstandingdue'\\]:\n        url2 = url\\.rstrip\\('/'\\) \\+ f'/rest/v1/\\{table\\}\\?select=\\{col\\}&limit=1'\n        req = urllib\\.request\\.Request\\(url2, headers=headers\\)\n        try:\n            with urllib\\.request\\.urlopen\\(req, timeout=20\\) as resp:\n                data = resp\\.read\\(\\)\\.decode\\('utf-8'\\)\n                print\\('OK', table, col, resp\\.status, data\\[:100\\]\\)\n        except urllib\\.error\\.HTTPError as e:\n            print\\('ERR', table, col, e\\.code, e\\.read\\(500\\)\\.decode\\('utf-8','ignore'\\)\\)\n            break\n        except Exception as e:\n            print\\('EXC', table, col, e\\)\n            break\n    print\\('---'\\)\nPY$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
 }

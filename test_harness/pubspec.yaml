@@ -1,0 +1,9 @@
+name: ws_e2e
+description: Integration harness — runs the real outbox against a real Postgres.
+publish_to: none
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+dependencies:
+  postgres: ^3.0.0
+dev_dependencies:
+  test: ^1.24.0

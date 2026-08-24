@@ -1,30 +1,41 @@
-// This is a basic Flutter widget test.
+// =============================================================================
+// test/widget_test.dart
 //
-// To perform an interaction with a widget in your test, use the WidgetTester
-// utility in the flutter_test package. For example, you can send tap and scroll
-// gestures. You can also use WidgetTester to find child widgets in the widget
-// tree, read text, and verify that the values of widget properties are correct.
+// WHY THIS PUMPS WsLoginScreen RATHER THAN WaterFlowApp
+//
+// It used to pump the whole app and assert on the first frame. That worked
+// only while the first frame WAS the login screen. Once a splash screen was
+// added ahead of the auth gate, frame one became the splash — which also
+// renders "WaterFlow", so the first assertion kept passing and quietly hid the
+// fact that the login screen was never being built at all.
+//
+// Pumping WsLoginScreen directly tests what the name promises and removes four
+// dependencies this test never wanted: splash timing, WsAuthGate, Supabase
+// initialisation, and startup routing. None of those are the login experience.
+//
+// Nothing in lib/ was changed to make this pass. The screen still renders both
+// strings; the old test simply stopped reaching it.
+// =============================================================================
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:watersuppliersaas/main.dart';
+import 'package:watersuppliersaas/screens/login_screen.dart';
+import 'package:watersuppliersaas/theme/ws_theme.dart';
 
 void main() {
-  testWidgets('Counter increments smoke test', (WidgetTester tester) async {
-    // Build our app and trigger a frame.
-    await tester.pumpWidget(const MyApp());
+  testWidgets('renders the login experience', (WidgetTester tester) async {
+    // MaterialApp supplies the Directionality, Theme and Navigator that any
+    // Scaffold needs. WsLoginScreen makes no service calls while building, so
+    // no Supabase client is required.
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: WsTheme.light(),
+        home: const WsLoginScreen(),
+      ),
+    );
 
-    // Verify that our counter starts at 0.
-    expect(find.text('0'), findsOneWidget);
-    expect(find.text('1'), findsNothing);
-
-    // Tap the '+' icon and trigger a frame.
-    await tester.tap(find.byIcon(Icons.add));
-    await tester.pump();
-
-    // Verify that our counter has incremented.
-    expect(find.text('0'), findsNothing);
-    expect(find.text('1'), findsOneWidget);
+    expect(find.text('WaterFlow'), findsOneWidget);
+    expect(find.text('Welcome back'), findsOneWidget);
   });
 }

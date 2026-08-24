@@ -1,0 +1,22 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // Without --dart-define-from-file the app starts in DEMO MODE: it has no
+      // Supabase credentials, so it uses the in-memory DemoStore and none of
+      // your real data appears. That is what the "starting in demo mode"
+      // message means.
+      "name": "watersuppliersaas (Supabase)",
+      "request": "launch",
+      "type": "dart",
+      "program": "lib/main.dart",
+      "toolArgs": ["--dart-define-from-file=.env"]
+    },
+    {
+      "name": "watersuppliersaas (demo mode, no backend)",
+      "request": "launch",
+      "type": "dart",
+      "program": "lib/main.dart"
+    }
+  ]
+}
