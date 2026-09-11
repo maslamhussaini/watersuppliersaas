@@ -39,3 +39,5 @@
 app.*.map.json
 app.*.symbols
 migrate_working_dir/
+
+.vercel
