@@ -22,8 +22,15 @@
 // ws_outbox_supabase.dart calls into this file, and it must stay that way.
 // =============================================================================
 
+import 'dart:async';
+
+import 'package:flutter/foundation.dart' show debugPrint;
+
 import '../main.dart' show supabase, supabaseClientInitialized;
+import 'storage/ws_key_value_store.dart';
+import 'storage/ws_kv_default.dart';
 import 'tenant_service.dart';
+import 'ws_store_snapshot.dart';
 
 class WsStore {
   final int storeId;
@@ -86,7 +93,30 @@ class WsStoreService {
     final orgId = await WsTenantService.currentOrgId;
     if (orgId == null) return _stores;
 
-    final rows = await supabase.rpc('ws_my_stores', params: {'p_orgid': orgId});
+    // Object?, not List: the `rows is! List` guard below is pre-existing and
+    // must keep working. Typing this as List would make that check dead code.
+    final Object? rows;
+    try {
+      rows = await supabase.rpc('ws_my_stores', params: {'p_orgid': orgId});
+    } catch (e) {
+      // OFFLINE. Fall back to the branches the server last offered.
+      //
+      // Without this, _selected stays null on a cold offline start and
+      // delivery_screen._save() throws "No store selected" before the delivery
+      // reaches the outbox — the durable queue never gets a chance to do its
+      // job. See ws_store_snapshot.dart.
+      //
+      // Only a THROW falls back. Every early return above is a real answer
+      // ("already loaded", "no client", "no organization") and must not be
+      // overridden by a snapshot.
+      final restored = await _restoreFromSnapshot(orgId);
+      if (restored) {
+        debugPrint('stores: server unreachable, using saved branches — $e');
+        return _stores;
+      }
+      rethrow;
+    }
+
     if (rows is! List) return _stores;
 
     _stores = rows
@@ -105,7 +135,82 @@ class WsStoreService {
               .firstWhere((s) => s.isDefault, orElse: () => _stores.first)
               .storeId;
     }
+
+    // THE SERVER ANSWERED, SO THE SERVER WINS. Overwrite whatever was saved.
+    await _persistSnapshot(orgId);
     return _stores;
+  }
+
+  // ── Offline snapshot ──────────────────────────────────────────────────────
+  //
+  // Injectable so tests can drive both halves without a platform channel, and
+  // so a test can make storage fail on demand — the one behaviour that cannot
+  // be provoked otherwise.
+  static Future<WsKeyValueStore> Function() snapshotStorage =
+      wsOpenDefaultKeyValueStore;
+
+  /// Best-effort. A storage failure must never fail a load that otherwise
+  /// worked: the branches are in memory and usable for this session either way.
+  static Future<void> _persistSnapshot(int orgId) async {
+    try {
+      final uid = supabase.auth.currentSession?.user.id;
+      if (uid == null) return;
+      await WsStoreSnapshotStore(await snapshotStorage()).write(
+        WsStoreSnapshot.of(
+          authUserId: uid,
+          orgId: orgId,
+          stores: _stores,
+          selectedStoreId: _selected,
+        ),
+      );
+    } catch (e) {
+      debugPrint('stores: could not save the branch snapshot — $e');
+    }
+  }
+
+  /// Repopulates [_stores] and [_selected] from the snapshot.
+  ///
+  /// Returns false — leaving state untouched — when there is nothing stored,
+  /// when it belongs to another user or organization, or when it is unreadable.
+  /// Never invents a branch.
+  static Future<bool> _restoreFromSnapshot(int orgId) async {
+    try {
+      final uid = supabase.auth.currentSession?.user.id;
+      // NO SESSION, NO RESTORE. The snapshot cannot create one, and without a
+      // uid there is nothing to match it against.
+      if (uid == null) return false;
+
+      final snap =
+          await WsStoreSnapshotStore(await snapshotStorage()).readFor(uid, orgId);
+      if (snap == null) return false;
+
+      final restored = snap.storeList;
+      if (restored.isEmpty) return false;
+
+      _stores = List.unmodifiable(restored);
+
+      // Honour the saved choice only if it is still one of the saved branches,
+      // mirroring the online rule above rather than trusting the stored id.
+      final saved = snap.selectedStoreId;
+      _selected = restored.any((s) => s.storeId == saved)
+          ? saved
+          : restored
+              .firstWhere((s) => s.isDefault, orElse: () => restored.first)
+              .storeId;
+      return true;
+    } catch (e) {
+      debugPrint('stores: could not read the branch snapshot — $e');
+      return false;
+    }
+  }
+
+  /// Removes the saved branches. Called on sign-out.
+  static Future<void> clearSnapshot() async {
+    try {
+      await WsStoreSnapshotStore(await snapshotStorage()).clear();
+    } catch (e) {
+      debugPrint('stores: could not clear the branch snapshot — $e');
+    }
   }
 
   /// Switch branch. Refuses a store the server did not offer, because the only
@@ -113,7 +218,18 @@ class WsStoreService {
   static bool select(int storeId) {
     if (!_stores.any((s) => s.storeId == storeId)) return false;
     _selected = storeId;
+
+    // Remember the choice, so a driver who picks a branch and then goes offline
+    // still stamps documents with it after a reload. Fire and forget: the
+    // selection has already taken effect in memory, and a storage failure must
+    // not make the picker appear to have done nothing.
+    unawaited(_persistSelection());
     return true;
+  }
+
+  static Future<void> _persistSelection() async {
+    final orgId = await WsTenantService.currentOrgId;
+    if (orgId != null) await _persistSnapshot(orgId);
   }
 
   /// Called when the organization changes, so one tenant's branches can never

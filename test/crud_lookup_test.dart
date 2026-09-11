@@ -324,4 +324,148 @@ void main() {
     expect(out!['active'], true);
     expect(out!['kind'], isNull);
   });
+
+  // ═══ A TOGGLE IS NEVER NULL ═══════════════════════════════════════════════
+  //
+  // Product Type → Save returned:
+  //   null value in column "isdefault" of relation "ws_tblbottletypes"
+  //   violates not-null constraint   (23502)
+  //
+  // ws_tblbottletypes.isdefault is `boolean not null default false`, and a
+  // column DEFAULT applies only when the column is OMITTED from the INSERT —
+  // sending null explicitly stores null and trips the constraint.
+  //
+  // An untouched toggle held null, and the switch renders `value == true`, so
+  // it LOOKED off while holding null. The form therefore only worked if the
+  // user tapped the switch on and then off again, which is why the obvious
+  // manual test (turn it on, save a default type) always passed.
+
+  group('a toggle never sends null', () {
+    Map<String, dynamic>? out;
+
+    Widget toggleForm({Map<String, dynamic>? initial, Object? fieldInitial}) {
+      out = null;
+      return MaterialApp(
+        home: Scaffold(
+          body: WsCrudForm(
+            title: 'Product Type',
+            initial: initial,
+            fields: [
+              const WsField('bottlecode', 'Code', required: true),
+              WsField(
+                'isdefault',
+                'Default product type',
+                type: WsFieldType.toggle,
+                initial: fieldInitial,
+              ),
+            ],
+            onSave: (v) async => out = v,
+          ),
+        ),
+      );
+    }
+
+    Future<void> save(WidgetTester t) async {
+      await t.enterText(find.byType(TextFormField).first, 'B06');
+      await t.tap(find.text('Save'));
+      await t.pumpAndSettle();
+    }
+
+    testWidgets('A. a new record with the toggle untouched saves false',
+        (t) async {
+      await t.pumpWidget(toggleForm());
+      await t.pumpAndSettle();
+      await save(t);
+
+      expect(out!['isdefault'], false,
+          reason: 'THE DEFECT: this was null, which is 23502 against a '
+              '`not null default false` column');
+      expect(out!['isdefault'], isNotNull);
+      expect(out!.containsKey('isdefault'), isTrue,
+          reason: 'still sent, just never as null');
+    });
+
+    testWidgets('B. toggling it ON saves true', (t) async {
+      await t.pumpWidget(toggleForm());
+      await t.pumpAndSettle();
+      await t.tap(find.byType(SwitchListTile));
+      await t.pumpAndSettle();
+      await save(t);
+
+      expect(out!['isdefault'], true);
+    });
+
+    testWidgets('C. ON then OFF saves false', (t) async {
+      await t.pumpWidget(toggleForm());
+      await t.pumpAndSettle();
+      await t.tap(find.byType(SwitchListTile));
+      await t.pumpAndSettle();
+      await t.tap(find.byType(SwitchListTile));
+      await t.pumpAndSettle();
+      await save(t);
+
+      expect(out!['isdefault'], false,
+          reason: 'the only path that worked before the fix — it must keep '
+              'working, and now it is no longer the only one');
+    });
+
+    testWidgets('D. an untouched toggle renders as off', (t) async {
+      await t.pumpWidget(toggleForm());
+      await t.pumpAndSettle();
+
+      final s = t.widget<SwitchListTile>(find.byType(SwitchListTile));
+      expect(s.value, isFalse,
+          reason: 'the display was already correct — only the stored value '
+              'was wrong, which is exactly why this went unnoticed');
+    });
+
+    // ── editing an existing row is unchanged ──────────────────────────────
+
+    testWidgets('editing a row with isdefault true keeps true', (t) async {
+      await t.pumpWidget(toggleForm(initial: const {
+        'bottlecode': 'BT19',
+        'isdefault': true,
+      }));
+      await t.pumpAndSettle();
+
+      expect(t.widget<SwitchListTile>(find.byType(SwitchListTile)).value,
+          isTrue);
+      await save(t);
+      expect(out!['isdefault'], true);
+    });
+
+    testWidgets('editing a row with isdefault false keeps false', (t) async {
+      await t.pumpWidget(toggleForm(initial: const {
+        'bottlecode': 'BT10',
+        'isdefault': false,
+      }));
+      await t.pumpAndSettle();
+      await save(t);
+
+      expect(out!['isdefault'], false);
+    });
+
+    testWidgets('a legacy row storing null is normalised to false', (t) async {
+      // Defensive: a row written before this fix could hold null. Editing it
+      // must not send that null straight back.
+      await t.pumpWidget(toggleForm(initial: const {
+        'bottlecode': 'OLD',
+        'isdefault': null,
+      }));
+      await t.pumpAndSettle();
+      await save(t);
+
+      expect(out!['isdefault'], false);
+    });
+
+    testWidgets('an explicit field initial of true is honoured', (t) async {
+      await t.pumpWidget(toggleForm(fieldInitial: true));
+      await t.pumpAndSettle();
+
+      expect(t.widget<SwitchListTile>(find.byType(SwitchListTile)).value,
+          isTrue);
+      await save(t);
+      expect(out!['isdefault'], true);
+    });
+  });
 }

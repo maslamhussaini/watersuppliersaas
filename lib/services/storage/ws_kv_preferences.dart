@@ -103,4 +103,13 @@ class WsPreferencesKeyValueStore implements WsKeyValueStore {
       if (key.startsWith('$namespace.')) await backend.remove(key);
     }
   }
+
+  @override
+  Future<List<String>> keys() async {
+    final p = '$namespace.';
+    return (await backend.keys())
+        .where((k) => k.startsWith(p))
+        .map((k) => k.substring(p.length))
+        .toList();
+  }
 }

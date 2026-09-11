@@ -14,11 +14,20 @@ import '../services/store_service.dart';
 import '../widgets/ws_lookup_field.dart';
 import 'import_customers_screen.dart';
 import '../services/supabase_service.dart';
+import '../services/ws_connectivity.dart';
 import '../theme/ws_responsive.dart';
 import '../theme/ws_theme.dart';
 
 class WsCustomersScreen extends StatefulWidget {
   const WsCustomersScreen({super.key});
+
+  /// The one seam this screen has, so the loading lifecycle can be exercised
+  /// without a network. Production value is WsDataService.fetchCustomers; the
+  /// query behind it is NOT changed by this screen.
+  @visibleForTesting
+  static Future<List<WsCustomer>> Function() fetch =
+      WsDataService.fetchCustomers;
+
   @override State<WsCustomersScreen> createState() => _WsCustomersScreenState();
 }
 
@@ -28,6 +37,13 @@ class _WsCustomersScreenState extends State<WsCustomersScreen> {
   String  _search = '';
   String  _filter = 'all';
   bool    _loading = true;
+  String? _error;
+
+  /// True when the last load was skipped because the device is offline, as
+  /// opposed to attempted and failed. Different cause, different message: the
+  /// old wording surfaced a raw ClientException, which reads as a malfunction
+  /// rather than "you have no signal".
+  bool    _offline = false;
   final   _money = NumberFormat('#,##0', 'en_US');
 
   @override void initState() { super.initState(); _load(); }
@@ -38,11 +54,42 @@ class _WsCustomersScreenState extends State<WsCustomersScreen> {
     super.dispose();
   }
 
+  /// ─── WHY THIS IS GUARDED ───────────────────────────────────────────────
+  ///
+  /// This was:
+  ///
+  ///     setState(() => _loading = true);
+  ///     final list = await WsDataService.fetchCustomers();   // no try/catch
+  ///
+  /// fetchCustomers reads vw_ws_customerbalance and has no offline path, so
+  /// offline it throws, the throw escapes as an unhandled async error, and
+  /// _loading STAYS TRUE FOREVER — a spinner that never resolves and never
+  /// explains itself. The chips kept reporting the previous count above it,
+  /// which is how it read as "the screen is broken" rather than "the load
+  /// failed".
+  ///
+  /// A failed refresh now keeps whatever was already loaded. Replacing a good
+  /// list with an empty one because a later refresh failed would destroy data
+  /// the user can still legitimately read.
   Future<void> _load() async {
-    setState(() => _loading = true);
-    final list = await WsDataService.fetchCustomers();
-    if (!mounted) return;
-    setState(() { _all = list; _applyFilter(); _loading = false; });
+    setState(() { _loading = true; _error = null; _offline = false; });
+    try {
+      final list = await WsCustomersScreen.fetch();
+      if (!mounted) return;
+      setState(() { _all = list; _error = null; });
+      _applyFilter();
+    } catch (e) {
+      if (!mounted) return;
+      // NOT swallowed, and NOT destructive: _all is left alone — those are
+      // real balances from a real load, and they stay on screen rather than
+      // being replaced by a cached projection that has no balance at all.
+      setState(() {
+        _offline = e is WsOfflineSkip;
+        _error = '$e';
+      });
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
   }
 
   void _applyFilter() {
@@ -58,6 +105,92 @@ class _WsCustomersScreenState extends State<WsCustomersScreen> {
         return matchSearch && matchFilter;
       }).toList();
     });
+  }
+
+  /// ─── AN EMPTY LIST MUST SAY WHY IT IS EMPTY ────────────────────────────
+  ///
+  /// This rendered `ListView(itemCount: 0)` — a blank rectangle with no text.
+  /// Three very different situations looked identical:
+  ///
+  ///   · a search that matched nothing
+  ///   · an organization with no customers yet
+  ///   · a load that failed
+  ///
+  /// The first is the one that produced the bug report. The screen is kept
+  /// alive by the dashboard's IndexedStack, so leaving the tab and coming back
+  /// preserves the search text — correctly, it is the user's typing — and the
+  /// list is still filtered by it. With no message, that reads as a broken
+  /// screen rather than an active filter.
+  ///
+  /// Scrollable on purpose: it is the child of a RefreshIndicator, which needs
+  /// a scrollable to accept the pull-to-refresh gesture.
+  Widget _emptyState() {
+    final searching = _search.trim().isNotEmpty;
+    final filtering = _filter != 'all';
+
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(32, 72, 32, 32),
+      children: [
+        Icon(
+          _error != null
+              ? Icons.cloud_off_outlined
+              : searching || filtering
+                  ? Icons.search_off_outlined
+                  : Icons.people_outline,
+          size: 48,
+          color: Colors.black26,
+        ),
+        const SizedBox(height: 16),
+        Text(
+          _error != null
+              ? (_offline ? 'Device is offline' : 'Could not load customers')
+              : 'No customers found',
+          textAlign: TextAlign.center,
+          style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+        ),
+        const SizedBox(height: 8),
+        Text(
+          _error != null
+              ? (_offline
+                  ? 'The customer list has not been loaded on this device yet, '
+                      'and there is no connection to load it now.'
+                  : 'The customer list could not be loaded.\n$_error')
+              : searching
+                  // The query is quoted so it is obvious WHICH text is
+                  // filtering — it may have been typed before the tab switch.
+                  ? 'No customers match "$_search".'
+                  : filtering
+                      ? 'No customers in this filter.'
+                      : 'No customers have been added yet.',
+          textAlign: TextAlign.center,
+          style: const TextStyle(fontSize: 13, color: Colors.black54),
+        ),
+        const SizedBox(height: 20),
+        if (_error != null)
+          Center(
+            child: FilledButton.icon(
+              onPressed: _load,
+              icon: const Icon(Icons.refresh),
+              label: const Text('Retry'),
+            ),
+          )
+        else if (searching || filtering)
+          Center(
+            child: OutlinedButton.icon(
+              // Clears the query the user cannot otherwise see the effect of.
+              // It does NOT run on tab switch — the search is deliberately
+              // preserved there; this is an explicit action.
+              onPressed: () {
+                _searchCtl.clear();
+                setState(() { _search = ''; _filter = 'all'; });
+                _applyFilter();
+              },
+              icon: const Icon(Icons.clear),
+              label: const Text('Clear Search'),
+            ),
+          ),
+      ],
+    );
   }
 
   void _showDetail(WsCustomer c) {
@@ -202,10 +335,45 @@ class _WsCustomersScreenState extends State<WsCustomersScreen> {
                 ),
             ]),
           ),
+          // ── A FAILED REFRESH THAT KEPT ITS DATA ───────────────────────
+          //
+          // _all is deliberately not discarded when a refresh fails, so the
+          // list still renders and the empty state never appears. Without
+          // this the failure would be completely invisible and the user would
+          // read stale figures as current. Same treatment the dashboard uses.
+          if (_error != null && _filtered.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+              child: Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: WsColors.red.withValues(alpha: 0.08),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: WsColors.red.withValues(alpha: 0.4)),
+                ),
+                child: Row(children: [
+                  const Icon(Icons.error_outline, color: WsColors.red, size: 20),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      _offline
+                          ? 'Showing the last loaded list — device is offline.'
+                          : 'Showing the last loaded list — could not refresh: '
+                              '$_error',
+                      style: const TextStyle(fontSize: 12, color: WsColors.red),
+                    ),
+                  ),
+                  TextButton(onPressed: _load, child: const Text('Retry')),
+                ]),
+              ),
+            ),
+
           // ── List ──────────────────────────────────────────────────────
           Expanded(
             child: _loading
                 ? const Center(child: CircularProgressIndicator())
+                : _filtered.isEmpty
+                ? RefreshIndicator(onRefresh: _load, child: _emptyState())
                 : RefreshIndicator(
               onRefresh: _load,
               child: ListView.separated(

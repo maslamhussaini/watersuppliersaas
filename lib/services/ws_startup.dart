@@ -69,6 +69,9 @@ class WsSubsystem {
   static const outbox = 'outbox';
   static const whatsNew = 'whatsNew';
   static const location = 'location';
+
+  /// Automatic outbox draining — sign-in, resume, timer. Launch blocker B1.
+  static const autoSync = 'autoSync';
 }
 
 /// Starts the optional subsystems independently.
@@ -82,6 +85,7 @@ Future<WsStartupReport> wsStartSubsystems({
   Future<void> Function()? initOutbox,
   Future<void> Function()? initWhatsNew,
   void Function()? initLocation,
+  void Function()? initAutoSync,
   void Function(String message)? log,
 }) async {
   final failures = <String, Object>{};
@@ -119,9 +123,26 @@ Future<WsStartupReport> wsStartSubsystems({
     'deliveries will be saved without a location',
   );
 
+  // AFTER the outbox, because it drives that queue. Started even when the
+  // outbox failed to init: WsOutboxService.sync() is a no-op with no queue, so
+  // this costs nothing and avoids a second failure mode where the triggers are
+  // silently absent. Its own try/catch for the same reason as the others — a
+  // timer that will not start must not be the thing that stops the app.
+  await attempt(
+    WsSubsystem.autoSync,
+    () async {
+      (initAutoSync ?? _startAutoSync)();
+    },
+    'the queue will only drain when someone presses Sync',
+  );
+
   return WsStartupReport(failures);
 }
 
 void _installGeolocator() {
   WsLocationService.provider = const WsGeolocatorProvider();
+}
+
+void _startAutoSync() {
+  WsOutboxService.startAutoSync();
 }

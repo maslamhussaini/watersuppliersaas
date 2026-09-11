@@ -12,6 +12,9 @@ import 'screens/dashboard_screen.dart';
 import 'screens/customer_portal_screen.dart';
 import 'screens/organization_selector_screen.dart';
 import 'services/auth_service.dart';
+import 'services/auth/ws_session_snapshot.dart';
+import 'services/cache/ws_customer_cache.dart';
+import 'services/storage/ws_kv_default.dart';
 import 'services/tenant_service.dart';
 import 'theme/ws_theme.dart';
 import 'models/ws_models.dart';
@@ -236,16 +239,115 @@ class WsAuthGateDeps {
         authChanges:
             supabaseClient?.auth.onAuthStateChange ?? const Stream.empty(),
         currentUserId: () => supabaseClient?.auth.currentSession?.user.id,
-        currentOrganization: () => WsTenantService.currentOrganization,
+        currentOrganization: WsAuthGate._organizationOrSnapshot,
         resolveRole: WsAuthGate._resolveAndLoad,
       );
 }
 
-class WsAuthGate extends StatelessWidget {
+/// Says out loud that the account details on screen came from this device, not
+/// from the server.
+///
+/// Without it, "we could not reach the server" and "your account is fine" look
+/// identical — and a driver who does not know they are offline has no reason to
+/// wonder why a customer they added on another device is missing.
+///
+/// Renders nothing at all when online, so it costs nothing in the normal case.
+/// Public only so a widget test can mount it directly. Nothing else constructs
+/// it — WsAuthGate wraps the dashboard with it and that is the sole use.
+class WsOfflineSessionBanner extends StatelessWidget {
+  final Widget child;
+
+  const WsOfflineSessionBanner({super.key, required this.child});
+
+  static const offlineSessionMessage =
+      'Offline — using account details saved on this device. Some data may be '
+      'out of date.';
+
+  Widget _strip(String message) => Material(
+        color: WsColors.amber,
+        child: SafeArea(
+          bottom: false,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            child: Row(
+              children: [
+                const Icon(Icons.cloud_off, size: 16, color: Colors.white),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    message,
+                    style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+
+  /// ─── TWO INDEPENDENT CONDITIONS ──────────────────────────────────────────
+  ///
+  /// They are not the same thing and one does not imply the other:
+  ///
+  ///   · running on the saved session snapshot means the server is unreachable;
+  ///   · customer search being online-only can happen while perfectly ONLINE,
+  ///     because an organization over the 25,000 ceiling is refused a cache
+  ///     during an ordinary refresh.
+  ///
+  /// So both are listened to, and each contributes its own strip. Collapsing
+  /// them into one message would state something false in whichever case is
+  /// not currently true.
+  @override
+  Widget build(BuildContext context) => ListenableBuilder(
+        listenable: Listenable.merge(
+            [wsUsingOfflineSession, wsOfflineCustomerSearchUnavailable]),
+        builder: (context, _) {
+          final messages = <String>[
+            if (wsUsingOfflineSession.value) offlineSessionMessage,
+            if (wsOfflineCustomerSearchUnavailable.value != null)
+              wsOfflineCustomerSearchUnavailable.value!,
+          ];
+
+          // Nothing to say costs nothing: the child is returned untouched, so
+          // the ordinary online case gains no wrapper.
+          if (messages.isEmpty) return child;
+
+          return Column(
+            children: [
+              for (final m in messages) _strip(m),
+              Expanded(child: child),
+            ],
+          );
+        },
+      );
+}
+
+/// True while the app is running on the saved snapshot instead of live data.
+///
+/// Exists so "we cannot reach the server" is visibly different from "your
+/// account is broken" — the two produced the same screen before, and only one
+/// of them is the user's problem.
+final ValueNotifier<bool> wsUsingOfflineSession = ValueNotifier(false);
+
+/// How long startup waits for the server before falling back.
+///
+/// The complaint was an app that appeared to hang. Offline, a PostgREST call
+/// does not fail promptly — it waits on TCP — so without a bound the spinner is
+/// the whole experience. Long enough for a slow-but-working connection, short
+/// enough that a driver does not think the app is broken.
+const wsStartupResolveWindow = Duration(seconds: 8);
+
+class WsAuthGate extends StatefulWidget {
   /// Null in production. Injected by test/auth_gate_test.dart.
   final WsAuthGateDeps? deps;
 
   const WsAuthGate({super.key, this.deps});
+
+  @override
+  State<WsAuthGate> createState() => _WsAuthGateState();
 
   /// Shown instead of an endless spinner when the gate cannot proceed.
   /// It always offers Sign out, so a broken account is never a dead end.
@@ -281,15 +383,165 @@ class WsAuthGate extends StatelessWidget {
   );
 
   /// Resolves the coarse role and warms the permission cache in one step.
+  static Future<WsSessionSnapshotStore> _snapshots() async =>
+      WsSessionSnapshotStore(await wsOpenDefaultKeyValueStore());
+
+  /// Which organization, asking the server first and the snapshot only if the
+  /// server cannot be reached.
+  ///
+  /// A NULL ANSWER IS NOT A FAILURE. Zero organizations, or several, is a real
+  /// result meaning "show the selector", and it must not be overridden by a
+  /// snapshot — otherwise a user who left an organization would be silently
+  /// put back into it. Only a throw or a timeout falls back.
+  static Future<WsOrganization?> _organizationOrSnapshot() async {
+    final uid = supabaseClient?.auth.currentSession?.user.id;
+    try {
+      final org = await WsTenantService.currentOrganization
+          .timeout(wsStartupResolveWindow);
+      wsUsingOfflineSession.value = false;
+      return org;
+    } catch (e) {
+      // NO SESSION, NO FALLBACK. The snapshot cannot create or extend one, and
+      // without a uid there is nothing to match it against.
+      if (uid == null) rethrow;
+
+      final snap = await (await _snapshots()).readFor(uid);
+      if (snap == null) {
+        // Nothing saved for THIS user. Fall through to the existing error
+        // screen rather than inventing an organization.
+        rethrow;
+      }
+
+      debugPrint('startup: server unreachable, using saved organization — $e');
+      wsUsingOfflineSession.value = true;
+      return snap.organizationOrNull;
+    }
+  }
+
+  /// Role and permissions, with the same rule, and the snapshot written on the
+  /// way through whenever the server answered.
   static Future<WsUserRole> _resolveAndLoad(String uid, int orgId) async {
-    final role = await AuthService.resolveRole(uid, orgId: orgId);
-    await AuthService.loadPermissions(orgId);
-    return role;
+    try {
+      final role =
+          await AuthService.resolveRole(uid, orgId: orgId)
+              .timeout(wsStartupResolveWindow);
+      await AuthService.loadPermissions(orgId).timeout(wsStartupResolveWindow);
+
+      // THE SERVER ANSWERED, SO THE SERVER WINS. Overwrite whatever was saved.
+      // Failing to save must never fail a sign-in that otherwise worked.
+      try {
+        final org = await WsTenantService.currentOrganization; // cached by now
+        if (org != null) {
+          await (await _snapshots()).write(WsSessionSnapshot.of(
+            authUserId: uid,
+            org: org,
+            role: role,
+            permissions: AuthService.permissions,
+          ));
+        }
+      } catch (e) {
+        debugPrint('startup: could not save the session snapshot — $e');
+      }
+
+      wsUsingOfflineSession.value = false;
+      return role;
+    } catch (e) {
+      final snap = await (await _snapshots()).readFor(uid);
+      // Must belong to this user AND this organization. A snapshot for a
+      // different org says nothing about the role held in this one.
+      if (snap == null || snap.orgId != orgId) rethrow;
+
+      // Without this the user would arrive with a role but no permissions, so
+      // every control would be disabled — which reads as a broken account
+      // rather than a missing network.
+      AuthService.applySnapshotPermissions(orgId, snap.permissions);
+
+      debugPrint('startup: server unreachable, using saved role — $e');
+      wsUsingOfflineSession.value = true;
+      return snap.role;
+    }
+  }
+
+}
+
+/// Holds the gate's futures so a rebuild REUSES them instead of restarting.
+///
+/// ─── THE INSTABILITY THIS FIXES ──────────────────────────────────────────────
+///
+/// build() used to construct everything inline:
+///
+///     final d = deps ?? WsAuthGateDeps.production();     // new deps per build
+///     FutureBuilder(future: d.currentOrganization(), …)  // NEW future per build
+///     FutureBuilder(future: d.resolveRole(uid, orgId), …)// NEW future per build
+///
+/// A FutureBuilder handed a brand-new future reports ConnectionState.waiting
+/// again, and both builders return a CircularProgressIndicator while waiting —
+/// so every rebuild REPLACED THE WHOLE DASHBOARD WITH A SPINNER and then put it
+/// back.
+///
+/// The rebuilds come from the auth stream. Offline, token refresh fails and
+/// retries, emitting repeated auth events. Each one restarted both futures, and
+/// resolveRole then waited the full wsStartupResolveWindow (8s) before falling
+/// back to the snapshot. That is the dashboard "refreshing repeatedly and never
+/// settling".
+///
+/// ─── KEYED, NOT JUST CACHED ──────────────────────────────────────────────────
+///
+/// A memo here is only safe if it can never hand one identity's answer to
+/// another. Both futures are therefore keyed:
+///
+///   organization → uid + the currently selected organization id
+///   role         → uid + the resolved orgId
+///
+/// so signing in as someone else, switching organization, or signing out and
+/// back in all produce a different key and a fresh resolve. Sign-out clears
+/// both outright rather than relying on the key alone.
+class _WsAuthGateState extends State<WsAuthGate> {
+  /// Built ONCE. A new deps object per build would also mean a new
+  /// authChanges stream reference each time, which is the other half of the
+  /// churn.
+  late final WsAuthGateDeps _deps = widget.deps ?? WsAuthGateDeps.production();
+
+  String? _orgKey;
+  Future<WsOrganization?>? _orgFuture;
+
+  String? _roleKey;
+  Future<WsUserRole>? _roleFuture;
+
+  /// Includes the selected organization id: WsTenantService.selectOrganization
+  /// clears its own cache, and without this the gate would keep serving the
+  /// organization the user just switched away from.
+  Future<WsOrganization?> _organizationFor(String uid) {
+    final key = '$uid|${WsTenantService.selectedOrgId}';
+    if (_orgKey != key || _orgFuture == null) {
+      _orgKey = key;
+      _orgFuture = _deps.currentOrganization();
+    }
+    return _orgFuture!;
+  }
+
+  Future<WsUserRole> _roleFor(String uid, int orgId) {
+    final key = '$uid|$orgId';
+    if (_roleKey != key || _roleFuture == null) {
+      _roleKey = key;
+      _roleFuture = _deps.resolveRole(uid, orgId);
+    }
+    return _roleFuture!;
+  }
+
+  /// Called when there is no session. Without this, signing out and back in as
+  /// the SAME user would reuse a future resolved before the sign-out — and the
+  /// organization selection is cleared by sign-out, so that answer is stale.
+  void _forgetResolved() {
+    _orgKey = null;
+    _orgFuture = null;
+    _roleKey = null;
+    _roleFuture = null;
   }
 
   @override
   Widget build(BuildContext context) {
-    final d = deps ?? WsAuthGateDeps.production();
+    final d = _deps;
 
     return StreamBuilder<Object?>(
       stream: d.authChanges,
@@ -297,11 +549,14 @@ class WsAuthGate extends StatelessWidget {
         // No client and no session both land here, exactly as before.
         final uid = d.currentUserId();
         if (uid == null) {
+          // Sign-out, or a session that never restored. Drop the resolved
+          // futures so the next sign-in resolves fresh.
+          _forgetResolved();
           return const WsLoginScreen();
         }
 
         return FutureBuilder<WsOrganization?>(
-          future: d.currentOrganization(),
+          future: _organizationFor(uid),
           builder: (context, orgSnap) {
             // connectionState, NOT hasData.
             //
@@ -319,7 +574,7 @@ class WsAuthGate extends StatelessWidget {
             }
 
             if (orgSnap.hasError) {
-              return _errorScreen(
+              return WsAuthGate._errorScreen(
                 'Could not load your organization',
                 orgSnap.error.toString(),
               );
@@ -334,7 +589,7 @@ class WsAuthGate extends StatelessWidget {
             // Resolve the role AND load permission codes before routing, so
             // the first frame of the dashboard already knows what to show.
             return FutureBuilder<WsUserRole>(
-              future: d.resolveRole(uid, org.orgId),
+              future: _roleFor(uid, org.orgId),
               builder: (context, roleSnap) {
                 if (roleSnap.connectionState != ConnectionState.done) {
                   return const Scaffold(
@@ -345,7 +600,7 @@ class WsAuthGate extends StatelessWidget {
                 // A thrown future also leaves hasData false, so the old check
                 // turned any permission-load failure into the same silent hang.
                 if (roleSnap.hasError) {
-                  return _errorScreen(
+                  return WsAuthGate._errorScreen(
                     'Could not determine your access level',
                     roleSnap.error.toString(),
                   );
@@ -355,7 +610,9 @@ class WsAuthGate extends StatelessWidget {
                   return const WsCustomerPortalScreen();
                 }
 
-                return const WsDashboardScreen();
+                return const WsOfflineSessionBanner(
+                  child: WsDashboardScreen(),
+                );
               },
             );
           },

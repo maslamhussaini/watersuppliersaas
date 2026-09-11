@@ -41,6 +41,14 @@ abstract class WsKeyValueStore {
 
   /// Everything this store owns. Used by sign-out-and-forget and by tests.
   Future<void> clear();
+
+  /// Every key currently held, so a caller can find a FAMILY of keys it wrote
+  /// under a shared shape — `outbox.instance.<uuid>` and the like.
+  ///
+  /// Added for the multi-tab outbox fix: two browser tabs share one backend,
+  /// and the only way for one to avoid overwriting the other is for each to own
+  /// a separate key and for the reader to enumerate them.
+  Future<List<String>> keys();
 }
 
 /// For tests, and for any platform where persistence is genuinely unavailable.
@@ -64,6 +72,9 @@ class WsMemoryKeyValueStore implements WsKeyValueStore {
 
   @override
   Future<void> clear() async => values.clear();
+
+  @override
+  Future<List<String>> keys() async => values.keys.toList();
 }
 
 /// Thrown by nothing here. Present so callers that DO care about a bad payload
@@ -116,5 +127,18 @@ class WsPrefixedKeyValueStore implements WsKeyValueStore {
       await inner.remove(_k(key));
     }
     _own.clear();
+  }
+
+  /// Namespaced keys, with the prefix stripped, so callers see the same key
+  /// space they write with. Reads the INNER store rather than [_own], because
+  /// _own only knows what this session wrote — a queue left by a previous tab
+  /// is exactly what the outbox needs to find.
+  @override
+  Future<List<String>> keys() async {
+    final p = '$prefix.';
+    return (await inner.keys())
+        .where((k) => k.startsWith(p))
+        .map((k) => k.substring(p.length))
+        .toList();
   }
 }

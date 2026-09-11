@@ -26,6 +26,7 @@ void main() {
     bool outboxFails = false,
     bool whatsNewFails = false,
     bool locationFails = false,
+    bool autoSyncFails = false,
     List<String>? order,
   }) =>
       wsStartSubsystems(
@@ -41,6 +42,10 @@ void main() {
           order?.add('location');
           if (locationFails) throw StateError('plugin missing');
         },
+        initAutoSync: () {
+          order?.add('autoSync');
+          if (autoSyncFails) throw StateError('no binding');
+        },
         log: logged.add,
       );
 
@@ -51,12 +56,16 @@ void main() {
       final order = <String>[];
       final report = await start(outboxFails: true, order: order);
 
-      expect(order, ['outbox', 'whatsNew', 'location'],
+      expect(order, ['outbox', 'whatsNew', 'location', 'autoSync'],
           reason: 'THE ORIGINAL BUG: these shared one try/catch, so the first '
               'throw skipped the rest');
       expect(report.failed(WsSubsystem.outbox), isTrue);
       expect(report.failed(WsSubsystem.whatsNew), isFalse);
       expect(report.failed(WsSubsystem.location), isFalse);
+      expect(report.failed(WsSubsystem.autoSync), isFalse,
+          reason: 'auto-sync starts even when the outbox did not — sync() is a '
+              'no-op without a queue, and silently absent triggers would be a '
+              'second way to reach launch blocker B1');
     });
 
     test('What\'s New failure does not prevent the GPS provider', () async {
@@ -177,5 +186,58 @@ void main() {
 
     expect(report.failed(WsSubsystem.location), isFalse);
     expect(() => report.allOk, returnsNormally);
+  });
+
+  // ═══ AUTOMATIC OUTBOX DRAINING IS WIRED (launch blocker B1) ═══════════════
+  //
+  // WsOutboxService.sync() existed and worked. Nothing called it except the
+  // Sync button, so a document whose first post failed waited for a human.
+  // These assert the STARTUP CONNECTION — the triggers themselves are covered
+  // in outbox_auto_sync_test.dart.
+  //
+  // Exactly the blind spot named in ws_startup.dart's header: the unit tests
+  // could not see the GPS bug because they injected a provider directly, which
+  // proves the wiring works without proving anybody did the wiring.
+
+  group('auto-sync is started', () {
+    test('startup starts it', () async {
+      final order = <String>[];
+      await start(order: order);
+
+      expect(order, contains('autoSync'),
+          reason: 'if startup never starts it, the queue only drains when '
+              'someone presses Sync — which IS launch blocker B1');
+    });
+
+    test('it starts last, after the queue it drives', () async {
+      final order = <String>[];
+      await start(order: order);
+
+      expect(order.indexOf('autoSync'), greaterThan(order.indexOf('outbox')));
+    });
+
+    test('it starts even when the outbox failed to initialise', () async {
+      final order = <String>[];
+      final report = await start(outboxFails: true, order: order);
+
+      expect(order, contains('autoSync'));
+      expect(report.failed(WsSubsystem.autoSync), isFalse);
+    });
+
+    test('its own failure does not take startup down', () async {
+      final report = await start(autoSyncFails: true);
+
+      expect(report.failed(WsSubsystem.autoSync), isTrue);
+      expect(report.failed(WsSubsystem.outbox), isFalse);
+      expect(report.failed(WsSubsystem.location), isFalse);
+    });
+
+    test('and that failure names the consequence out loud', () async {
+      await start(autoSyncFails: true);
+
+      expect(logged.join(' '), contains('only drain when someone presses Sync'),
+          reason: 'a silent auto-sync failure is indistinguishable from a '
+              'queue that has nothing to do');
+    });
   });
 }

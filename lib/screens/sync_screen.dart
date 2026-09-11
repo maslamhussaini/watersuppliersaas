@@ -22,6 +22,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:intl/intl.dart';
 
 import '../services/outbox/ws_outbox.dart';
@@ -52,6 +53,73 @@ String wsSyncLabel(WsOutboxStatus s) => switch (s) {
       WsOutboxStatus.failed => 'Needs attention',
     };
 
+// ═══ Rebuilding safely when the queue changes ════════════════════════════════
+
+/// Subscribes to [WsOutbox.changes] and rebuilds, without ever throwing.
+///
+/// ─── THE BUG THIS EXISTS FOR ─────────────────────────────────────────────────
+///
+/// Both widgets below used to do this directly:
+///
+///     _sub = box.changes.listen((_) { if (mounted) setState(() {}); });
+///
+/// `mounted` guards a DISPOSED widget. It does not guard the other way a
+/// setState fails: being called while a frame is already being built, which
+/// throws "setState() or markNeedsBuild() called during build".
+///
+/// That is reachable on the ordinary success path. A save calls
+/// navigator.pop(true) while the drain is still running, so the `synced`
+/// notification lands exactly as the screen underneath is rebuilding. A
+/// listener callback has no error handling of its own, so the throw escapes to
+/// the zone as an uncaught error — and, worse, the rebuild it was supposed to
+/// perform never happens. The badge then keeps showing the pre-sync count over
+/// a queue that is fully synced, which is precisely the stale badge that was
+/// reported.
+///
+/// So: if a frame is in flight, defer to just after it. Otherwise rebuild now.
+/// Errors are logged rather than swallowed — a UI that cannot repaint is worth
+/// knowing about, but it must never take the app down with it.
+mixin _WsQueueRebuild<T extends StatefulWidget> on State<T> {
+  StreamSubscription<void>? _queueSub;
+
+  /// Names this listener in any log line, so two identical messages from two
+  /// widgets remain distinguishable.
+  String get debugWho;
+
+  void startListeningToQueue() {
+    _queueSub = WsOutboxService.instanceOrNull?.changes.listen(
+      (_) => _rebuildSafely(),
+      // Guards an error ON the stream. A throw INSIDE the callback is handled
+      // by the try/catch below — onError does not see those.
+      onError: (Object e) => debugPrint('$debugWho: queue stream error — $e'),
+    );
+  }
+
+  void stopListeningToQueue() {
+    _queueSub?.cancel();
+    _queueSub = null;
+  }
+
+  void _rebuildSafely() {
+    if (!mounted) return;
+    try {
+      if (SchedulerBinding.instance.schedulerPhase ==
+          SchedulerPhase.persistentCallbacks) {
+        // A frame is being built right now; setState would throw. Repaint on
+        // the very next frame instead — the queue state is already correct, so
+        // nothing is lost by showing it one frame later.
+        SchedulerBinding.instance.addPostFrameCallback((_) {
+          if (mounted) setState(() {});
+        });
+      } else {
+        setState(() {});
+      }
+    } catch (e) {
+      debugPrint('$debugWho: rebuild after a queue change failed — $e');
+    }
+  }
+}
+
 // ═══ Badge for the app bar ═══════════════════════════════════════════════════
 
 /// Shows nothing when the queue is empty and everything is synced, an amber
@@ -63,8 +131,10 @@ class WsSyncBadge extends StatefulWidget {
   State<WsSyncBadge> createState() => _WsSyncBadgeState();
 }
 
-class _WsSyncBadgeState extends State<WsSyncBadge> {
-  StreamSubscription<void>? _sub;
+class _WsSyncBadgeState extends State<WsSyncBadge>
+    with _WsQueueRebuild<WsSyncBadge> {
+  @override
+  String get debugWho => 'sync badge';
 
   @override
   void initState() {
@@ -72,14 +142,12 @@ class _WsSyncBadgeState extends State<WsSyncBadge> {
     // Rebuild whenever the queue changes. The outbox owns the truth; this
     // widget never caches a count of its own, because a stale badge that says
     // "0 pending" over a queue with three items is the failure mode here.
-    _sub = WsOutboxService.instanceOrNull?.changes.listen((_) {
-      if (mounted) setState(() {});
-    });
+    startListeningToQueue();
   }
 
   @override
   void dispose() {
-    _sub?.cancel();
+    stopListeningToQueue();
     super.dispose();
   }
 
@@ -169,55 +237,118 @@ class WsSyncScreen extends StatefulWidget {
   State<WsSyncScreen> createState() => _WsSyncScreenState();
 }
 
-class _WsSyncScreenState extends State<WsSyncScreen> {
-  StreamSubscription<void>? _sub;
+class _WsSyncScreenState extends State<WsSyncScreen>
+    with _WsQueueRebuild<WsSyncScreen> {
   bool _syncing = false;
+
+  @override
+  String get debugWho => 'sync queue';
 
   @override
   void initState() {
     super.initState();
-    _sub = WsOutboxService.instanceOrNull?.changes.listen((_) {
-      if (mounted) setState(() {});
-    });
+    startListeningToQueue();
   }
 
   @override
   void dispose() {
-    _sub?.cancel();
+    stopListeningToQueue();
     super.dispose();
   }
 
+  /// ─── WHY THIS IS WRAPPED ─────────────────────────────────────────────────
+  ///
+  /// This is invoked from `onPressed:`, which takes a VoidCallback. An async
+  /// function called there is FIRE AND FORGET: nobody holds the returned
+  /// future, so a throw from WsOutboxService.sync() becomes an unhandled async
+  /// error — a bare "Uncaught Error" with no Dart context in a release build.
+  ///
+  /// That is the same defect that was just closed on the five drain call sites
+  /// in ws_outbox_supabase.dart. Guarding those and leaving the Sync button
+  /// unguarded would mean the one path a user takes *when something is already
+  /// wrong* is the one that fails silently.
+  ///
+  /// The button also spins. Without a `finally` a throw would leave _syncing
+  /// true forever, so the control disables itself permanently and the only way
+  /// to sync again is to reopen the screen.
+  ///
+  /// Nothing about the sync itself changes here: no status transitions, no
+  /// retry budget, no idempotency, no algorithm. Only what happens to an
+  /// exception that previously had nowhere to go.
   Future<void> _syncNow() async {
     setState(() => _syncing = true);
     final messenger = ScaffoldMessenger.of(context);
-    final report = await WsOutboxService.sync();
-    if (!mounted) return;
-    setState(() => _syncing = false);
-    messenger.showSnackBar(SnackBar(
-      content: Text(report.stoppedOn != null
-          ? 'Stopped at "${report.stoppedOn!.label}" — still offline?'
-          : '${report.posted} sent, ${report.failed} failed.'),
-    ));
+    try {
+      final report = await WsOutboxService.sync();
+      if (!mounted) return;
+      messenger.showSnackBar(SnackBar(
+        content: Text(report.stoppedOn != null
+            ? 'Stopped at "${report.stoppedOn!.label}" — still offline?'
+            : '${report.posted} sent, ${report.failed} failed.'),
+      ));
+    } catch (e) {
+      // Reported twice on purpose: to the log for diagnosis, and to the user,
+      // who pressed a button and is owed an answer. Never swallowed — a Sync
+      // that quietly does nothing is indistinguishable from one that worked.
+      debugPrint('sync_screen: manual sync failed — $e');
+      if (!mounted) return;
+      messenger.showSnackBar(SnackBar(
+        content: Text('Could not sync: $e'),
+        backgroundColor: WsColors.red,
+        duration: const Duration(seconds: 6),
+      ));
+    } finally {
+      // The queue is untouched by any of this — nothing was lost, and the next
+      // drain picks it up. Only the spinner needs resetting.
+      if (mounted) setState(() => _syncing = false);
+    }
   }
 
+  /// Wrapped for the same reason as [_syncNow] — invoked from a button, so an
+  /// exception has nobody to return to.
+  ///
+  /// The reconcile step makes this MORE exposed than a plain retry, not less:
+  /// it is a network read that can fail on its own, before anything has been
+  /// re-posted. An unhandled throw there would leave a Failed item looking
+  /// untouched with no explanation.
+  ///
+  /// Retry classification and the outbox's own logic are unchanged; this only
+  /// decides what the user is told when the attempt cannot even be made.
   Future<void> _retry(WsOutboxItem item) async {
     final box = WsOutboxService.instanceOrNull;
     if (box == null) return;
     final messenger = ScaffoldMessenger.of(context);
 
-    // BEFORE re-posting, ASK THE SERVER whether it already has it. A read,
-    // never a write. After a long outage the server may already agree with us,
-    // and reconciling is both faster and safer than another post.
-    final reconciled = await WsOutboxService.reconcile(item.clientUuid);
-    if (reconciled) {
+    setState(() => _syncing = true);
+    try {
+      // BEFORE re-posting, ASK THE SERVER whether it already has it. A read,
+      // never a write. After a long outage the server may already agree with
+      // us, and reconciling is both faster and safer than another post.
+      final reconciled = await WsOutboxService.reconcile(item.clientUuid);
+      if (reconciled) {
+        if (!mounted) return;
+        messenger.showSnackBar(const SnackBar(
+          content: Text('Already on the server — marked as synced.'),
+        ));
+        return;
+      }
+
+      await box.retry(item.clientUuid);
+    } catch (e) {
+      debugPrint('sync_screen: retry failed — $e');
       if (!mounted) return;
-      messenger.showSnackBar(const SnackBar(
-        content: Text('Already on the server — marked as synced.'),
+      messenger.showSnackBar(SnackBar(
+        content: Text('Could not retry: $e'),
+        backgroundColor: WsColors.red,
+        duration: const Duration(seconds: 6),
       ));
       return;
+    } finally {
+      if (mounted) setState(() => _syncing = false);
     }
 
-    await box.retry(item.clientUuid);
+    // OUTSIDE the try: _syncNow owns its own error handling, and nesting it
+    // here would report a sync failure as a retry failure.
     await _syncNow();
   }
 
@@ -263,7 +394,7 @@ class _WsSyncScreenState extends State<WsSyncScreen> {
     final items = box == null
         ? <WsOutboxItem>[]
         : (box.visibleToCurrentUser.toList()
-          ..sort((a, b) => b.seq.compareTo(a.seq)));
+          ..sort((a, b) => wsOutboxOrder(b, a)));   // newest first, total order
 
     return Scaffold(
       appBar: AppBar(

@@ -78,4 +78,7 @@ class WsFileKeyValueStore implements WsKeyValueStore {
     _cache = {};
     await _flush();
   }
+
+  @override
+  Future<List<String>> keys() async => (await _load()).keys.toList();
 }

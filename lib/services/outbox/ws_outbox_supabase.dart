@@ -29,15 +29,23 @@
 
 import 'dart:async';
 
+import 'package:flutter/foundation.dart' show debugPrint, visibleForTesting;
+
 import '../storage/ws_kv_default.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 // `supabase` and `supabaseClientInitialized` are top-level getters in main.dart,
 // not members of WsDataService. supabase_service.dart imports main.dart for the
 // same reason, so the (permitted, getter-only) cycle is already established.
-import '../../main.dart' show supabase, supabaseClientInitialized;
+import '../../main.dart'
+    show supabase, supabaseClient, supabaseClientInitialized;
+import '../cache/ws_customer_cache.dart';
+import '../cache/ws_master_cache.dart';
 import '../location_service.dart';
+import '../supabase_service.dart';
+import '../tenant_service.dart';
 import 'ws_outbox.dart';
+import 'ws_outbox_auto_sync.dart';
 import 'ws_outbox_lookup.dart';
 import 'ws_outbox_store.dart';
 
@@ -73,7 +81,16 @@ class WsOutboxService {
 
     // Anything stranded by the last run goes out now. Failing is fine — it
     // stays queued.
-    unawaited(box.drain());
+    //
+    // Still fire-and-forget, unlike the enqueue paths: nobody is reading a
+    // status here, and startup must not wait on the network. But the throw is
+    // no longer allowed to escape — an unguarded unawaited() surfaces as a
+    // bare "Uncaught Error" with no Dart context in a release build, which is
+    // indistinguishable from a crash and impossible to diagnose.
+    unawaited(box.drain().catchError((Object e) {
+      debugPrint('outbox: startup drain failed — $e');
+      return const WsDrainReport();
+    }));
     return box;
   }
 
@@ -83,6 +100,51 @@ class WsOutboxService {
   // an in-flight HTTP request exists nowhere if the process dies. Writing it
   // to disk first costs a few milliseconds and makes the save durable before
   // anything can go wrong.
+
+  /// How long a save waits for the post before reporting. See [_settle].
+  static const settleWindow = Duration(seconds: 3);
+
+  /// Post, and give it a BOUNDED chance to finish before the caller reports.
+  ///
+  /// ─── WHY THIS IS NOT `unawaited(box.drain())` ANY MORE ───────────────────
+  ///
+  /// Every caller does `final item = await record...()` and then switches on
+  /// `item.status`. With a fire-and-forget drain that read happened while the
+  /// status was still `pending`, because drain() awaits a persist and an HTTP
+  /// round trip before it can be anything else. So an ONLINE save that
+  /// succeeded a few hundred milliseconds later still told the driver
+  /// "Saved on this device — waiting to sync".
+  ///
+  /// The comment above that switch says the message must match reality. It
+  /// did not: it sampled reality before reality existed.
+  ///
+  /// ─── WHAT IS DELIBERATELY UNCHANGED ──────────────────────────────────────
+  ///
+  /// Enqueue-before-post still happens; the document is durable before this is
+  /// called. The drain algorithm, WsPostResult classification, the retry
+  /// budget, the network-vs-budgeted distinction and every status transition
+  /// are untouched — this only decides how long the CALLER waits before
+  /// reporting.
+  ///
+  /// The wait is bounded, so offline is not punished: drain() fails fast with
+  /// no connection, and if the network merely hangs the caller is released
+  /// after [settleWindow] and truthfully reports the item as still queued. The
+  /// drain carries on in the background either way, so nothing is abandoned.
+  ///
+  /// catchError is attached to the drain BEFORE the timeout, not after. A
+  /// throw arriving once the timeout has already fired would otherwise land on
+  /// a future nobody is holding — which is exactly how a successful sync could
+  /// still produce an uncaught error.
+  static Future<void> _settle(WsOutbox box) async {
+    final draining = box.drain().catchError((Object e) {
+      debugPrint('outbox: drain failed — $e');
+      return const WsDrainReport();
+    });
+    await draining.timeout(
+      settleWindow,
+      onTimeout: () => const WsDrainReport(),
+    );
+  }
 
   static Future<WsOutboxItem> recordDelivery({
     required String clientUuid,
@@ -134,7 +196,7 @@ class WsOutboxService {
       label: '$delivered out / $returned in — $customerName',
     );
 
-    unawaited(box.drain());
+    await _settle(box);
     return item;
   }
 
@@ -168,7 +230,7 @@ class WsOutboxService {
       label: 'Payment $amount — $customerName',
     );
 
-    unawaited(box.drain());
+    await _settle(box);
     return item;
   }
 
@@ -207,7 +269,7 @@ class WsOutboxService {
       label: 'Paid $amount — $vendorName',
     );
 
-    unawaited(box.drain());
+    await _settle(box);
     return item;
   }
 
@@ -251,7 +313,7 @@ class WsOutboxService {
       label: '${lines.length} line${lines.length == 1 ? '' : 's'} — $vendorName',
     );
 
-    unawaited(box.drain());
+    await _settle(box);
     return item;
   }
 
@@ -273,20 +335,74 @@ class WsOutboxService {
           .timeout(const Duration(seconds: 25));
       final id = result is num ? result.toInt() : null;
       return WsPostResult.success(documentId: id);
-    } on PostgrestException catch (e) {
+    } catch (e) {
+      // ONE catch, delegating to a classifier that can be called directly.
+      // The chain below preserves the previous `on X catch` ORDER exactly;
+      // only reachability changed, so that the rules can be tested without a
+      // live Supabase client. See classifyPostError.
+      return classifyPostError(e);
+    }
+  }
+
+  /// Maps a thrown error onto the outcome that decides an item's fate.
+  ///
+  /// Visible for testing because this is the whole safety argument of the
+  /// queue: NETWORK means "never reached a server, keep it pending forever",
+  /// and anything else spends a slice of the attempt budget that ends in
+  /// Failed. Getting one line of it wrong strands real deliveries, which is
+  /// exactly what happened, so it must be reachable by a test rather than
+  /// only by a browser and a disconnected cable.
+  @visibleForTesting
+  static WsPostResult classifyPostError(Object e) {
+    if (e is PostgrestException) {
       return _classifyPostgrest(e);
-    } on AuthException catch (e) {
-      // The session expired while the item sat in the queue. Retryable: the
-      // SDK refreshes tokens, and the next drain after a sign-in succeeds.
+    }
+    if (e is AuthException) {
+      // ─── A FAILED REFRESH IS NOT AN EXPIRED SESSION ────────────────────
+      //
+      // When the access token needs refreshing, the SDK calls
+      //     /auth/v1/token?grant_type=refresh_token
+      // BEFORE the RPC. Offline, that call never leaves the browser, and
+      // gotrue turns the transport error into AuthRetryableFetchException —
+      // see gotrue fetch.dart, `if (error is! Response) throw
+      // AuthRetryableFetchException(...)`. "is not a Response" is precisely
+      // "no server ever answered".
+      //
+      // This clause used to catch that as a plain AuthException and report
+      // "Sign-in expired", which is a SERVER-produced verdict and therefore
+      // consumes the attempt budget. Eight offline drains later the delivery
+      // sat in Failed — and because `pending` excludes failed items,
+      // hasPendingWork() then returned false and no timer, auth event or
+      // resume could ever pick it up again. A delivery made out of coverage
+      // walked itself into a state only a human could escape, which is the
+      // exact outcome the network-classification rule in ws_outbox.dart
+      // exists to prevent.
+      //
+      // The generic catch below already classifies `ClientException` as
+      // network correctly — this clause simply intercepted it first.
+      //
+      // The TYPE is the test, not the message: a genuinely rejected refresh
+      // token comes back as a real HTTP response and becomes
+      // AuthApiException with a 4xx status, so it still falls through to the
+      // "Sign-in expired" case below, where it belongs.
+      if (e is AuthRetryableFetchException) {
+        return WsPostResult.network(
+            'Sign-in refresh could not reach the server: ${e.message}');
+      }
+
+      // A genuine auth failure. Retryable, not permanent: the SDK refreshes
+      // tokens, and the next drain after a sign-in succeeds.
       return WsPostResult.retryable('Sign-in expired: ${e.message}');
-    } on TimeoutException catch (e) {
+    }
+    if (e is TimeoutException) {
       // THE DANGEROUS ONE. The request may well have been applied. Retry is
       // correct and safe — migration 010 makes the second attempt a read.
       //
       // Classed as NETWORK: a timeout is the signature failure of a bad
       // connection, and it must not push a real delivery into Failed.
       return WsPostResult.network('Timed out: $e');
-    } catch (e) {
+    }
+    {
       final s = '$e';
       if (s.contains('SocketException') ||
           s.contains('Failed host lookup') ||
@@ -390,6 +506,104 @@ class WsOutboxService {
   /// a timer.
   static Future<WsDrainReport> sync() async =>
       _box?.drain() ?? const WsDrainReport();
+
+  // ── Automatic draining ───────────────────────────────────────────────────
+
+  static WsOutboxAutoSync? _autoSync;
+
+  /// The running auto-sync, or null. Exposed so startup diagnostics and tests
+  /// can assert the wiring exists rather than assuming it.
+  static WsOutboxAutoSync? get autoSyncOrNull => _autoSync;
+
+  /// Starts automatic draining: on sign-in, on resume, and on a timer.
+  ///
+  /// Launch blocker B1. Before this, [sync] was reachable only from the Sync
+  /// button, so a document whose first post failed waited for a human.
+  ///
+  /// Adds no sync machinery — every trigger calls [sync], which is already
+  /// safe to call repeatedly because drain() refuses to run twice at once.
+  /// Idempotent: calling it again returns the running instance.
+  static WsOutboxAutoSync startAutoSync({
+    Stream<Object?>? authChanges,
+    Duration interval = const Duration(minutes: 2),
+  }) {
+    final existing = _autoSync;
+    if (existing != null && existing.isRunning) return existing;
+
+    final auto = WsOutboxAutoSync(
+      // Drain the queue, then refresh the master-data caches if they have gone
+      // stale.
+      //
+      // REUSES THE EXISTING TRIGGERS rather than adding a second scheduler:
+      // auth change, app resume and the periodic tick already fire at exactly
+      // the moments connectivity is worth re-testing, and WsOutboxAutoSync
+      // already guards this callback against throwing.
+      //
+      // Note the timer tick is gated on hasPendingWork, so on a completely idle
+      // app the refresh rides on auth change and resume rather than the timer.
+      // That is deliberate — an idle app must not re-parse stored keys and
+      // re-query Supabase every two minutes — and the staleness window makes
+      // the difference immaterial.
+      sync: () async {
+        await sync();
+        await refreshMasterDataIfStale();
+      },
+      // Reads the live queue each tick rather than capturing a count, so the
+      // timer notices work enqueued after it started.
+      hasPendingWork: () => (_box?.pendingCount ?? 0) > 0,
+      authChanges:
+          authChanges ?? supabaseClient?.auth.onAuthStateChange,
+      interval: interval,
+      log: debugPrint,
+    );
+    auto.start();
+    return _autoSync = auto;
+  }
+
+  /// Refetches staff and products when the cache has aged past
+  /// [WsMasterCache.staleAfter], so an offline New Delivery opens with data
+  /// that is recent rather than whatever was there at sign-in.
+  ///
+  /// Calls the ordinary fetchers, which already write the cache on success.
+  /// Nothing here knows about serialisation, and there is no second refresh
+  /// path to keep in step with the first.
+  ///
+  /// Never throws: offline this is expected to fail, and it is called from a
+  /// background trigger that nobody is awaiting.
+  static Future<void> refreshMasterDataIfStale() async {
+    try {
+      if (!supabaseClientInitialized) return;
+      final uid = supabaseClient?.auth.currentSession?.user.id;
+      if (uid == null) return;
+      final orgId = await WsTenantService.currentOrgId;
+      if (orgId == null) return;
+
+      if (await WsMasterCache.isStale(WsMasterCache.staffKey,
+          uid: uid, orgId: orgId)) {
+        await WsDataService.fetchStaff();
+      }
+      if (await WsMasterCache.isStale(WsMasterCache.productsKey,
+          uid: uid, orgId: orgId)) {
+        await WsDataService.fetchProducts();
+        await WsDataService.fetchDefaultProductId();
+      }
+      // Customers last: it is the expensive one, and a six-hour window rather
+      // than fifteen minutes keeps an ordinary session from repeatedly pulling
+      // thousands of rows.
+      if (await WsCustomerCache.isStale(uid: uid, orgId: orgId)) {
+        await WsDataService.populateCustomerCache();
+      }
+    } catch (e) {
+      debugPrint('master data: refresh skipped — $e');
+    }
+  }
+
+  /// Stops automatic draining. Nothing is lost — the queue is durable and the
+  /// next start picks it up.
+  static void stopAutoSync() {
+    _autoSync?.stop();
+    _autoSync = null;
+  }
 
   // ── Storage health ───────────────────────────────────────────────────────
 

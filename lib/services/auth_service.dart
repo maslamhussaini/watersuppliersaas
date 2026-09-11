@@ -24,6 +24,7 @@
 // server-side — hiding a button is not access control.
 // =============================================================================
 
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../main.dart';
 import '../models/ws_models.dart';
@@ -33,8 +34,11 @@ import 'auth/ws_auth_supabase.dart';
 import 'auth/ws_phone_verification.dart';
 import 'auth/ws_registration_attempt_store.dart';
 import 'auth/ws_registration_flow.dart';
+import 'auth/ws_session_snapshot.dart';
 import 'storage/ws_kv_default.dart';
+import 'cache/ws_master_cache.dart';
 import 'demo_service.dart';
+import 'store_service.dart';
 import 'tenant_service.dart';
 
 class AuthService {
@@ -172,6 +176,26 @@ class AuthService {
   /// [loadPermissions] has run.
   static WsPermissions get permissions => _permissions;
 
+  /// Installs permission codes that came from the offline session snapshot
+  /// rather than from the server.
+  ///
+  /// EXISTS BECAUSE [loadPermissions] REQUIRES A SERVER. With no connection it
+  /// throws, and WsAuthGate would then have a role but no permissions — every
+  /// button disabled, which reads as a broken account rather than a missing
+  /// network.
+  ///
+  /// This does not weaken anything. Permission codes decide which controls
+  /// RENDER; every write is still checked by RLS, which is untouched and which
+  /// this cannot reach. A tampered snapshot buys a visible menu item and a
+  /// server rejection behind it.
+  ///
+  /// Deliberately NOT named loadPermissions: this bypasses the server, and the
+  /// call site should have to say so.
+  static void applySnapshotPermissions(int orgId, WsPermissions permissions) {
+    _permissions = permissions;
+    _permissionsOrgId = orgId;
+  }
+
   /// Loads permission codes for [orgId] from the caller's membership. One
   /// round trip, cached per organization for the session.
   ///
@@ -248,6 +272,10 @@ class AuthService {
   static void clearPermissions() {
     _permissions = const WsPermissions.none();
     _permissionsOrgId = null;
+    // The role memo shares this lifecycle deliberately: one hook, so a
+    // sign-out or organization switch cannot clear one and leave the other.
+    _role = null;
+    _roleKey = null;
   }
 
   /// Coarse routing decision only: staff dashboard or customer portal.
@@ -255,7 +283,41 @@ class AuthService {
   /// [orgId] should always be supplied. Without it a multi-organization user
   /// cannot be resolved unambiguously, and the query below deliberately takes
   /// the first row rather than throwing — see note 2 in the header.
+  /// Memoised per uid + orgId. See [_roleKey].
+  ///
+  /// ─── WHY ─────────────────────────────────────────────────────────────────
+  ///
+  /// WsAuthGate calls this on every resolve, and it was the ONLY step in the
+  /// gate with no memo — currentOrganization has _cachedOrg and loadPermissions
+  /// has _permissionsOrgId. Offline that meant a live query that waited the full
+  /// wsStartupResolveWindow (8s) before the snapshot fallback, on every auth
+  /// event, which is what made the dashboard cycle through a spinner.
+  ///
+  /// ─── INVALIDATION ────────────────────────────────────────────────────────
+  ///
+  /// Keyed on uid AND orgId, so another user or another organization can never
+  /// be served this answer. Cleared by [clearPermissions], which sign-out,
+  /// selectOrganization and clearSelection already call — the same hook
+  /// loadPermissions relies on, so there is no second lifecycle to keep in step.
+  ///
+  /// The trade is the same one loadPermissions already accepts: a role changed
+  /// server-side is not seen until sign-out or an organization switch.
+  static WsUserRole? _role;
+  static String? _roleKey;
+
   static Future<WsUserRole> resolveRole(String authUserId, {int? orgId}) async {
+    final key = '$authUserId|$orgId';
+    final cached = _role;
+    if (_roleKey == key && cached != null) return cached;
+
+    final resolved = await _resolveRoleUncached(authUserId, orgId: orgId);
+    _role = resolved;
+    _roleKey = key;
+    return resolved;
+  }
+
+  static Future<WsUserRole> _resolveRoleUncached(String authUserId,
+      {int? orgId}) async {
     if (!supabaseClientInitialized) {
       return DemoStore().resolveRole(authUserId, orgId: orgId);
     }
@@ -406,6 +468,31 @@ class AuthService {
 
   static Future<void> signOut() async {
     clearPermissions();
+
+    // THE SHARED-DEVICE RULE. The offline startup snapshot holds this user's
+    // organization, role and permission codes. readFor() already refuses to
+    // return it to a different uid, but leaving it on disk after an explicit
+    // sign-out keeps one driver's account details on a tablet the next driver
+    // uses. Removing it costs nothing: it is rebuilt on the next sign-in.
+    //
+    // Best-effort on purpose. A storage failure must never prevent a sign-out —
+    // being unable to leave is worse than a stale snapshot that is already
+    // unreadable to anyone else.
+    try {
+      await WsSessionSnapshotStore(await wsOpenDefaultKeyValueStore()).clear();
+    } catch (e) {
+      debugPrint('signOut: could not clear the session snapshot — $e');
+    }
+
+    // Same rule for the saved branches: the next driver on this tablet must
+    // not inherit the previous one's store. clearSnapshot swallows and logs its
+    // own failures for the same reason as above.
+    await WsStoreService.clearSnapshot();
+
+    // And the master-data caches, for the same reason: one driver's staff list
+    // and product prices must not be visible to the next on a shared tablet.
+    await WsMasterCache.clear();
+
     if (!supabaseClientInitialized) {
       DemoStore().signOut();
       WsTenantService.clearSelection();

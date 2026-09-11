@@ -16,13 +16,17 @@
 // call sites are gone.
 // =============================================================================
 
+import 'package:flutter/foundation.dart' show debugPrint;
 import '../main.dart';
 import '../models/ws_models.dart';
 import 'location_service.dart';
 import 'store_service.dart';
 import 'auth_service.dart';
 import 'demo_service.dart';
+import 'cache/ws_customer_cache.dart';
+import 'cache/ws_master_cache.dart';
 import 'tenant_service.dart';
+import 'ws_connectivity.dart';
 
 class WsDataService {
   /// Resolves the active organization or throws a message the UI can show.
@@ -39,6 +43,12 @@ class WsDataService {
   // ── Organization ──────────────────────────────────────────────────────────
 
   static Future<WsOrganization?> fetchOrg() async {
+    // OFFLINE: fail fast. Placed FIRST — before the supabaseClientInitialized
+    // check — for the same two reasons as fetchRows: being offline is a fact
+    // about the device, and a guard placed after that early return is
+    // unreachable from a VM test and so could only be verified by inspection.
+    if (!WsConnectivity.isOnline()) throw const WsOfflineSkip();
+
     if (!supabaseClientInitialized) {
       return DemoStore().currentOrganization();
     }
@@ -125,20 +135,142 @@ class WsDataService {
     return row != null ? WsInternalUser.fromJson(row) : null;
   }
 
+  /// The uid every cache entry is bound to. Null before sign-in.
+  static String? get _uid => AuthService.currentUser?.id;
+
+  /// The ten columns the offline customer cache stores.
+  ///
+  /// NARROW AT THE QUERY, not only at rest. fetchCustomers() selects the whole
+  /// view, which for 25,000 rows is a download nobody needs — the projection has
+  /// to reduce transfer as well as storage. Same source, same org and isactive
+  /// semantics, same ordering.
+  /// ─── THE SOURCE IS THE TABLE, NOT THE BALANCE VIEW ───────────────────────
+  ///
+  /// This first read vw_ws_customerbalance and failed in the browser with
+  ///
+  ///     column vw_ws_customerbalance.storeid does not exist
+  ///
+  /// The view is defined in migration 007 with an explicit column list; storeid
+  /// was added to ws_tblcustomers by migration 015 and the view was never
+  /// updated. It also exposes the area rate under its real name,
+  /// `rateperbottle` — there has never been a column called `arearate`; that is
+  /// only what the Dart field is called (WsCustomer.fromJson has always read
+  /// `rateperbottle`).
+  ///
+  /// So the cache is populated from ws_tblcustomers, which is ALSO the table
+  /// WsLookupService.customers searches. Same source, same orgid and isactive
+  /// filters, same ordering — the parity the cache exists to preserve is now
+  /// structural rather than something two queries have to agree about.
+  ///
+  /// areaname and rateperbottle come from an embedded read across the existing
+  /// ws_tblcustomers.areaid → ws_tblareas.areaid foreign key (migration 003).
+  /// No view, table or migration changes; PostgREST embedding is already used
+  /// in auth_service, tenant_service and fetchDefaultProductId.
+  static const _customerCacheColumns =
+      'customerid, customername, customercode, phone, storeid, areaid, '
+      'rateoverride, bottlebalance, ws_tblareas(areaname, rateperbottle)';
+
+  /// Refills the offline customer cache. Returns false when it was refused —
+  /// over the ceiling, or storage would not take it.
+  ///
+  /// Never throws: called from a background refresh nobody is awaiting.
+  static Future<bool> populateCustomerCache() async {
+    try {
+      if (!supabaseClientInitialized) return false;
+      final uid = _uid;
+      final orgId = await WsTenantService.currentOrgId;
+      if (uid == null || orgId == null) return false;
+
+      final rows = await supabase
+          .from('ws_tblcustomers')
+          .select(_customerCacheColumns)
+          .eq('orgid', orgId)
+          .eq('isactive', true)
+          .order('customername');
+
+      // Awaited inside the try on purpose: replace() reports quota refusal by
+      // returning false, but a storage layer that throws must be caught here
+      // rather than escaping this background call.
+      return await WsCustomerCache.replace(
+        uid: uid,
+        orgId: orgId,
+        rows: rows.cast<Map<String, dynamic>>().map(flattenCustomerRow).toList(),
+      );
+    } catch (e) {
+      // A refresh failure MUST leave the previous cache intact — replace() is
+      // never reached, so nothing was touched.
+      debugPrint('customer cache: refresh failed, keeping what is stored — $e');
+      return false;
+    }
+  }
+
+  /// Lifts the embedded area onto the row, so what is cached is flat.
+  ///
+  /// PostgREST returns an embed as a nested object (or a single-element list,
+  /// depending on how it resolves the relationship), and a cache full of nested
+  /// shapes would push that variability into every reader. Both forms are
+  /// handled here, once.
+  ///
+  /// Visible for testing: the flattening is the part most likely to be wrong,
+  /// and it cannot be exercised through a live PostgREST response.
+  static Map<String, dynamic> flattenCustomerRow(Map<String, dynamic> row) {
+    final out = Map<String, dynamic>.from(row)..remove('ws_tblareas');
+
+    final embedded = row['ws_tblareas'];
+    final area = embedded is List
+        ? (embedded.isEmpty ? null : embedded.first)
+        : embedded;
+
+    if (area is Map) {
+      out['areaname'] = area['areaname'];
+      // The REAL column name. WsCustomer.fromJson reads the same key, so the
+      // cached row and a server row agree on where the area rate lives.
+      out['rateperbottle'] = area['rateperbottle'];
+    }
+    return out;
+  }
+
   static Future<List<WsInternalUser>> fetchStaff() async {
     if (!supabaseClientInitialized) return [];
     final orgId = await WsTenantService.currentOrgId;
     if (orgId == null) return [];
 
-    final rows = await supabase
-        .from('ws_tblinternalusers')
-        .select()
-        .eq('orgid', orgId)
-        .eq('isactive', true)
-        .order('fullname');
-    return rows
-        .map<WsInternalUser>((r) => WsInternalUser.fromJson(r))
-        .toList();
+    try {
+      // OFFLINE FAST PATH. Skips a call that cannot succeed, straight to the
+      // cache fallback below. See ws_connectivity.dart: only `false` is
+      // trusted, so online behaviour is untouched.
+      if (!WsConnectivity.isOnline()) throw const WsOfflineSkip();
+      final rows = await supabase
+          .from('ws_tblinternalusers')
+          .select()
+          .eq('orgid', orgId)
+          .eq('isactive', true)
+          .order('fullname');
+
+      final parsed = rows.cast<Map<String, dynamic>>();
+      // THE SERVER ANSWERED, SO THE SERVER WINS. Best-effort; a cache write can
+      // never fail a fetch that already succeeded.
+      final uid = _uid;
+      if (uid != null) {
+        await WsMasterCache.write(WsMasterCache.staffKey,
+            uid: uid, orgId: orgId, rows: parsed);
+      }
+      return parsed.map(WsInternalUser.fromJson).toList();
+    } catch (e) {
+      // OFFLINE. Fall back to the staff the server last offered, so New
+      // Delivery can still name a driver. Rethrow when there is nothing
+      // cached — inventing an empty list would silently record every delivery
+      // with a null driver, which is the bug this dropdown was added to fix.
+      final uid = _uid;
+      if (uid == null) rethrow;
+
+      final env = await WsMasterCache.read(WsMasterCache.staffKey,
+          uid: uid, orgId: orgId);
+      if (env == null) rethrow;
+
+      debugPrint('staff: server unreachable, using cached list — $e');
+      return env.rows.map(WsInternalUser.fromJson).toList();
+    }
   }
 
   // ── Areas ─────────────────────────────────────────────────────────────────
@@ -197,6 +329,23 @@ class WsDataService {
     }
     final orgId = await WsTenantService.currentOrgId;
     if (orgId == null) return [];
+
+    // ─── OFFLINE: FAIL FAST, DO NOT SUBSTITUTE ──────────────────────────────
+    //
+    // Unlike the other offline-capable reads, this one has NO cache fallback
+    // and deliberately gains none. WsCustomerRow — the cached projection —
+    // carries no outstandingdue, so serving it here would render every
+    // customer with `due == 0`: the Due filter would come back empty and the
+    // Settled filter would return everyone. A driver would be told that every
+    // customer has paid. That is worse than a stale list, because a stale list
+    // is at least a figure that was once true.
+    //
+    // So offline this throws immediately instead of spending ~7s on postgrest's
+    // GET retry ladder (1s + 2s + 4s) to reach the same failure. The screen's
+    // existing handler keeps the last loaded list — real balances, honestly
+    // labelled as not current — and offers Retry.
+    if (!WsConnectivity.isOnline()) throw const WsOfflineSkip();
+
     final rows = await supabase
         .from('vw_ws_customerbalance')
         .select()
@@ -215,14 +364,53 @@ class WsDataService {
     }
     final orgId = await WsTenantService.currentOrgId;
     if (orgId == null) return null;
-    // Read the view so outstandingdue and deposit value come back too.
-    final row = await supabase
-        .from('vw_ws_customerbalance')
-        .select()
-        .eq('customerid', id)
-        .eq('orgid', orgId)
-        .maybeSingle();
-    return row != null ? WsCustomer.fromJson(row) : null;
+    try {
+      // OFFLINE FAST PATH. Skips a call that cannot succeed, straight to the
+      // cache fallback below. See ws_connectivity.dart: only `false` is
+      // trusted, so online behaviour is untouched.
+      if (!WsConnectivity.isOnline()) throw const WsOfflineSkip();
+
+      // Read the view so outstandingdue and deposit value come back too.
+      final row = await supabase
+          .from('vw_ws_customerbalance')
+          .select()
+          .eq('customerid', id)
+          .eq('orgid', orgId)
+          .maybeSingle();
+      return row != null ? WsCustomer.fromJson(row) : null;
+    } catch (e) {
+      // OFFLINE SELECTION. Rebuild from the cached projection.
+      //
+      // The reconstructed record carries the four fields New Delivery reads —
+      // customerId, customerName, bottleBalance, effectiveRate — plus the area
+      // name the picker shows. outstandingDue, depositAmount, contactPerson and
+      // address are NOT in the projection and come back null/zero, which is why
+      // this fallback belongs to the delivery path and must not be borrowed by
+      // a screen that displays a balance.
+      final uid = _uid;
+      if (uid == null) rethrow;
+
+      final cached = await WsCustomerCache.load(uid: uid, orgId: orgId);
+      if (cached == null) rethrow;
+
+      final c = cached.where((r) => r.customerId == id).firstOrNull;
+      if (c == null) rethrow;
+
+      debugPrint('customer $id: server unreachable, using cached record — $e');
+      return WsCustomer(
+        customerId: c.customerId,
+        orgId: orgId,
+        areaId: c.areaId ?? 0,
+        customerName: c.customerName,
+        customerCode: c.customerCode,
+        phone: c.phone,
+        rateOverride: c.rateOverride,
+        bottleBalance: c.bottleBalance,
+        createdDate: DateTime.now(),
+        areaName: c.areaName,
+        areaRate: c.areaRate,
+      );
+    }
   }
 
   /// Portal lookup: which customer record belongs to this auth user.
@@ -323,13 +511,51 @@ class WsDataService {
     if (!supabaseClientInitialized) return [];
     final orgId = await WsTenantService.currentOrgId;
     if (orgId == null) return [];
-    final rows = await supabase
-        .from('ws_tblproducts')
-        .select()
-        .eq('orgid', orgId)
-        .eq('isactive', true)
-        .order('productname');
-    return rows.cast<Map<String, dynamic>>();
+
+    try {
+      // OFFLINE FAST PATH. Skips a call that cannot succeed, straight to the
+      // cache fallback below. See ws_connectivity.dart: only `false` is
+      // trusted, so online behaviour is untouched.
+      if (!WsConnectivity.isOnline()) throw const WsOfflineSkip();
+      final rows = await supabase
+          .from('ws_tblproducts')
+          .select()
+          .eq('orgid', orgId)
+          .eq('isactive', true)
+          .order('productname');
+
+      final parsed = rows.cast<Map<String, dynamic>>();
+      final uid = _uid;
+      if (uid != null) {
+        // The default product id is written alongside, by
+        // fetchDefaultProductId, into the same entry's meta.
+        await WsMasterCache.write(WsMasterCache.productsKey,
+            uid: uid,
+            orgId: orgId,
+            rows: parsed,
+            meta: await _productsMeta(uid, orgId));
+      }
+      return parsed;
+    } catch (e) {
+      final uid = _uid;
+      if (uid == null) rethrow;
+
+      final env = await WsMasterCache.read(WsMasterCache.productsKey,
+          uid: uid, orgId: orgId);
+      if (env == null) rethrow;
+
+      debugPrint('products: server unreachable, using cached list — $e');
+      return env.rows;
+    }
+  }
+
+  /// Preserves the default product id already cached, so refreshing the list
+  /// does not discard it. Written properly by [fetchDefaultProductId].
+  static Future<Map<String, dynamic>> _productsMeta(
+      String uid, int orgId) async {
+    final env = await WsMasterCache.read(WsMasterCache.productsKey,
+        uid: uid, orgId: orgId);
+    return env?.meta ?? const {};
   }
 
   /// Authoritative price for a customer, resolved server-side.
@@ -361,17 +587,50 @@ class WsDataService {
     if (!supabaseClientInitialized) return null;
     final orgId = await WsTenantService.currentOrgId;
     if (orgId == null) return null;
-    final row = await supabase
-        .from('ws_tblproducts')
-        .select('productid, ws_tblbottletypes!inner(isdefault)')
-        .eq('orgid', orgId)
-        .eq('isactive', true)
-        .eq('ws_tblbottletypes.isdefault', true)
-        .order('productid')
-        .limit(1)
-        .maybeSingle();
-    if (row == null) return null;
-    return (row['productid'] as num).toInt();
+
+    try {
+      // OFFLINE FAST PATH. Skips a call that cannot succeed, straight to the
+      // cache fallback below. See ws_connectivity.dart: only `false` is
+      // trusted, so online behaviour is untouched.
+      if (!WsConnectivity.isOnline()) throw const WsOfflineSkip();
+      final row = await supabase
+          .from('ws_tblproducts')
+          .select('productid, ws_tblbottletypes!inner(isdefault)')
+          .eq('orgid', orgId)
+          .eq('isactive', true)
+          .eq('ws_tblbottletypes.isdefault', true)
+          .order('productid')
+          .limit(1)
+          .maybeSingle();
+
+      final id = row == null ? null : (row['productid'] as num).toInt();
+
+      // Stored in the products entry's meta rather than a key of its own: it
+      // is one number that is meaningless without the list it indexes into.
+      final uid = _uid;
+      if (uid != null) {
+        final env = await WsMasterCache.read(WsMasterCache.productsKey,
+            uid: uid, orgId: orgId);
+        if (env != null) {
+          await WsMasterCache.write(WsMasterCache.productsKey,
+              uid: uid,
+              orgId: orgId,
+              rows: env.rows,
+              meta: {...env.meta, 'defaultProductId': id});
+        }
+      }
+      return id;
+    } catch (e) {
+      final uid = _uid;
+      if (uid == null) rethrow;
+
+      final env = await WsMasterCache.read(WsMasterCache.productsKey,
+          uid: uid, orgId: orgId);
+      if (env == null) rethrow;
+
+      debugPrint('default product: server unreachable, using cached — $e');
+      return (env.meta['defaultProductId'] as num?)?.toInt();
+    }
   }
 
   /// Price this customer will actually be billed for one default bottle.
@@ -650,6 +909,38 @@ class WsDataService {
     bool activeOnly = true,
     String columns = '*',
   }) async {
+    // ─── OFFLINE: FAIL FAST ─────────────────────────────────────────────────
+    //
+    // The shared loader for every WsCrudScreen — bottle types, product prices,
+    // customer groups, routes, vendors, products — plus fetchOptions, which
+    // fills their dropdowns. Offline each of those cost ~7s waiting out
+    // postgrest's GET retry ladder (1s + 2s + 4s) to reach a failure that was
+    // certain from the start.
+    //
+    // WsCrudScreen already handles this correctly: its FutureBuilder has a
+    // hasError branch with Retry, distinct from its "Nothing yet" empty state.
+    // So there is nothing to add on the screen side — this only makes the
+    // failure arrive immediately instead of after seven seconds.
+    //
+    // ─── WHY THIS IS FIRST, BEFORE THE supabaseClientInitialized CHECK ──────
+    //
+    // Two reasons, and the second is the one that made me choose it:
+    //
+    //   1. Being offline is a fact about the DEVICE, independent of whether a
+    //      client happens to be configured. Returning [] in that case would
+    //      report "there are no bottle types" when the truth is "we could not
+    //      look". The other early return here has exactly that flaw and is
+    //      deliberately left alone — it is a separate, pre-existing issue.
+    //
+    //   2. Placed after those returns, the guard is UNREACHABLE from a VM test
+    //      (supabaseClientInitialized is false there), so it could only ever be
+    //      verified by inspection. Placed here it is genuinely testable.
+    //
+    // No production behaviour changes: main() shows _SetupRequiredApp and
+    // returns when Supabase cannot be configured, so a CRUD screen is never
+    // reachable with an uninitialised client.
+    if (!WsConnectivity.isOnline()) throw const WsOfflineSkip();
+
     if (!supabaseClientInitialized) return [];
     final orgId = await WsTenantService.currentOrgId;
     if (orgId == null) return [];
@@ -859,6 +1150,12 @@ class WsDataService {
       );
 
   static Future<List<Map<String, dynamic>>> fetchPurchases() async {
+    // OFFLINE: fail fast. Placed FIRST — before the supabaseClientInitialized
+    // check — for the same two reasons as fetchRows: being offline is a fact
+    // about the device, and a guard placed after that early return is
+    // unreachable from a VM test and so could only be verified by inspection.
+    if (!WsConnectivity.isOnline()) throw const WsOfflineSkip();
+
     if (!supabaseClientInitialized) return [];
     final orgId = await WsTenantService.currentOrgId;
     if (orgId == null) return [];
@@ -930,6 +1227,12 @@ class WsDataService {
   }
 
   static Future<List<Map<String, dynamic>>> fetchVendorPayments() async {
+    // OFFLINE: fail fast. Placed FIRST — before the supabaseClientInitialized
+    // check — for the same two reasons as fetchRows: being offline is a fact
+    // about the device, and a guard placed after that early return is
+    // unreachable from a VM test and so could only be verified by inspection.
+    if (!WsConnectivity.isOnline()) throw const WsOfflineSkip();
+
     if (!supabaseClientInitialized) return [];
     final orgId = await WsTenantService.currentOrgId;
     if (orgId == null) return [];
@@ -1169,6 +1472,12 @@ class WsDataService {
   /// What has already been entered as opening stock, so the form can show it
   /// rather than making the user guess whether zero means unset or zero.
   static Future<List<Map<String, dynamic>>> fetchOpeningStock() async {
+    // OFFLINE: fail fast. Placed FIRST — before the supabaseClientInitialized
+    // check — for the same two reasons as fetchRows: being offline is a fact
+    // about the device, and a guard placed after that early return is
+    // unreachable from a VM test and so could only be verified by inspection.
+    if (!WsConnectivity.isOnline()) throw const WsOfflineSkip();
+
     if (!supabaseClientInitialized) return [];
     final orgId = await WsTenantService.currentOrgId;
     if (orgId == null) return [];
@@ -1534,6 +1843,12 @@ class WsDataService {
 
   /// Customers with their currently recorded opening figures.
   static Future<List<Map<String, dynamic>>> fetchCustomerOpenings() async {
+    // OFFLINE: fail fast. Placed FIRST — before the supabaseClientInitialized
+    // check — for the same two reasons as fetchRows: being offline is a fact
+    // about the device, and a guard placed after that early return is
+    // unreachable from a VM test and so could only be verified by inspection.
+    if (!WsConnectivity.isOnline()) throw const WsOfflineSkip();
+
     if (!supabaseClientInitialized) return [];
     final orgId = await WsTenantService.currentOrgId;
     if (orgId == null) return [];
@@ -1548,6 +1863,12 @@ class WsDataService {
 
   /// Vendors with their currently recorded opening figures.
   static Future<List<Map<String, dynamic>>> fetchVendorOpenings() async {
+    // OFFLINE: fail fast. Placed FIRST — before the supabaseClientInitialized
+    // check — for the same two reasons as fetchRows: being offline is a fact
+    // about the device, and a guard placed after that early return is
+    // unreachable from a VM test and so could only be verified by inspection.
+    if (!WsConnectivity.isOnline()) throw const WsOfflineSkip();
+
     if (!supabaseClientInitialized) return [];
     final orgId = await WsTenantService.currentOrgId;
     if (orgId == null) return [];

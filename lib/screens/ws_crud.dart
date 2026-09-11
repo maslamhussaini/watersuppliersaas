@@ -556,10 +556,21 @@ class WsCrudFormState extends State<WsCrudForm> {
       final v = widget.initial?[f.column] ?? f.initial;
       // if/else rather than a switch: no dependence on whether this Dart
       // version wants `break` in a non-empty case body.
-      if (f.type == WsFieldType.dropdown ||
+      if (f.type == WsFieldType.toggle) {
+        // A TOGGLE IS NEVER NULL. Off is a value, not an absence.
+        //
+        // This defaulted to null, and the switch renders `value == true`, so
+        // an untouched toggle LOOKED off while holding null. Save then sent
+        // isdefault: null to a `boolean not null default false` column — and a
+        // column default only applies when the column is OMITTED, never when
+        // null is sent explicitly. Result: 23502 on every new product type
+        // unless the user happened to tap the switch on and off again.
+        _values[f.column] = v == true;
+      } else if (f.type == WsFieldType.dropdown ||
           f.type == WsFieldType.lookup ||
-          f.type == WsFieldType.toggle ||
           f.type == WsFieldType.date) {
+        // These three keep passing null through: for them null means "nothing
+        // chosen", which is a legitimate value the column usually accepts.
         _values[f.column] = v;
       } else {
         _text[f.column] = TextEditingController(text: v?.toString() ?? '');
@@ -619,9 +630,14 @@ class WsCrudFormState extends State<WsCrudForm> {
 
     final out = <String, dynamic>{};
     for (final f in widget.fields) {
-      if (f.type == WsFieldType.dropdown ||
-          f.type == WsFieldType.lookup ||
-          f.type == WsFieldType.toggle) {
+      if (f.type == WsFieldType.toggle) {
+        // Belt and braces with initState above. Guarding only one of the two
+        // would leave the bug reachable from any future path that seeds
+        // _values directly, and a null here is a 23502 rather than a wrong
+        // checkbox — worth two lines.
+        out[f.column] = _values[f.column] == true;
+      } else if (f.type == WsFieldType.dropdown ||
+          f.type == WsFieldType.lookup) {
         // A lookup stores the id and nothing else, so the payload handed to
         // onSave is byte-identical to what the dropdown produced.
         out[f.column] = _values[f.column];

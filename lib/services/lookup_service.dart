@@ -31,9 +31,12 @@
 
 import 'dart:async';
 
+import 'auth_service.dart';
+import 'cache/ws_customer_cache.dart';
 import '../main.dart' show supabase, supabaseClientInitialized;
 import 'store_service.dart';
 import 'tenant_service.dart';
+import 'ws_connectivity.dart';
 
 /// How many rows a lookup will ever return. Small on purpose: a picker showing
 /// forty results is a picker nobody reads, and the answer to "too many matches"
@@ -164,17 +167,58 @@ class WsLookupService {
       request = request.eq('storeid', storeId);
     }
 
-    final rows = await request.order('customername').limit(limit);
+    try {
+      // OFFLINE FAST PATH. Skips a call that cannot succeed, straight to the
+      // cache fallback below — the same path, reached sooner. Debounce,
+      // ordering, limit and store filtering are all unchanged.
+      if (!WsConnectivity.isOnline()) throw const WsOfflineSkip();
 
-    return (rows as List).map((r) {
-      final phone = '${r['phone'] ?? ''}';
-      final code = '${r['customercode'] ?? ''}';
-      return WsLookupResult(
-        id: (r['customerid'] as num).toInt(),
-        label: '${r['customername'] ?? ''}',
-        subtitle: [code, phone].where((s) => s.isNotEmpty).join(' · '),
+      final rows = await request.order('customername').limit(limit);
+
+      return (rows as List).map((r) {
+        final phone = '${r['phone'] ?? ''}';
+        final code = '${r['customercode'] ?? ''}';
+        return WsLookupResult(
+          id: (r['customerid'] as num).toInt(),
+          label: '${r['customername'] ?? ''}',
+          subtitle: [code, phone].where((s) => s.isNotEmpty).join(' · '),
+        );
+      }).toList();
+    } catch (e) {
+      // OFFLINE. The server is preferred and was tried first; only a throw
+      // reaches here.
+      final uid = AuthService.currentUser?.id;
+      if (uid == null) rethrow;
+
+      final cached = await WsCustomerCache.load(uid: uid, orgId: orgId);
+      // No COMPLETE cache. Rethrowing rather than returning an empty list is
+      // deliberate: "no results" and "we could not look" must not render the
+      // same, or a driver concludes the customer does not exist.
+      if (cached == null) rethrow;
+
+      final hits = WsCustomerCache.searchIn(
+        cached,
+        // Already sanitised above by wsSanitiseSearch — the SAME function the
+        // server query was built from. Never re-sanitised here.
+        q,
+        storeId: storeId,
+        includeAllStores: includeAllStores,
+        isMultiStore: WsStoreService.isMultiStore,
+        limit: limit,
       );
-    }).toList();
+
+      // Built HERE, from the same expression as the online branch, so the two
+      // cannot drift into different subtitle formats.
+      return hits.map((c) {
+        final phone = c.phone ?? '';
+        final code = c.customerCode ?? '';
+        return WsLookupResult(
+          id: c.customerId,
+          label: c.customerName,
+          subtitle: [code, phone].where((s) => s.isNotEmpty).join(' · '),
+        );
+      }).toList();
+    }
   }
 
   /// Vendors. ORGANIZATION-WIDE — no store filter, deliberately. See the file

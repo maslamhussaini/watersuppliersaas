@@ -103,7 +103,20 @@ expected_functions(schema_name, name, created_by) as (
     ('ws',     'post_purchase',            '006'),
     ('ws',     'post_vendor_payment',      '006'),
     ('public', 'ws_set_vendor_opening',    '006'),
-    ('ws',     'is_portal',                '008')
+    ('ws',     'is_portal',                '008'),
+    -- The free-tier customer cap. Absent from install.sql until launch blocker
+    -- B2 was fixed, so a clean install silently had no limit enforcement at
+    -- all — the account screen showed "12 of 50" and nothing stopped the 51st.
+    ('ws',     'tg_customer_plan_limit',   '019')
+),
+
+-- Triggers are checked separately: a function can exist while nothing calls it,
+-- which is the exact shape of the 019 gap. The function alone is not the rule —
+-- these two are.
+expected_triggers(tbl, name, created_by) as (
+  values
+    ('ws_tblcustomers', 'trg_customer_plan_limit_ins', '019'),
+    ('ws_tblcustomers', 'trg_customer_plan_limit_upd', '019')
 ),
 
 -- Columns added to pre-existing tables by 000. If a table exists but these are
@@ -224,11 +237,36 @@ schema_status as (
          then '' else 'run migrations/001' end as detail
 ),
 
+trigger_status as (
+  select
+    'TRIGGER'    as kind,
+    e.tbl || '.' || e.name as object_name,
+    e.created_by as migration,
+    case
+      when t.oid is null      then 'MISSING'
+      -- 'D' is disabled. A disabled limit trigger is a limit that is not
+      -- enforced, and it would otherwise read as present.
+      when t.tgenabled = 'D'  then 'DISABLED'
+      else 'OK'
+    end as status,
+    case
+      when t.oid is null     then 'run migrations/' || e.created_by
+      when t.tgenabled = 'D' then 'alter table public.' || e.tbl
+                                  || ' enable trigger ' || e.name
+      else '' end as detail
+  from expected_triggers e
+  left join pg_trigger t
+    on t.tgname = e.name
+   and t.tgrelid = ('public.' || e.tbl)::regclass
+   and not t.tgisinternal
+),
+
 all_status as (
   select * from schema_status
   union all select * from table_status
   union all select * from view_status
   union all select * from function_status
+  union all select * from trigger_status
 )
 
 select
@@ -250,6 +288,7 @@ order by
     when 'NO RLS'        then 3
     when 'NOT INVOKER'   then 4
     when 'NO POLICIES'   then 5
+    when 'DISABLED'      then 6
     else 9
   end,
   kind,

@@ -15,6 +15,56 @@ import '../theme/ws_theme.dart';
 import '../widgets/ws_lookup_field.dart';
 import 'sync_screen.dart';
 
+/// Which product the screen should open on.
+///
+/// Pure, and top-level so it can be tested without a Supabase client — the
+/// preselect rule is the part of this feature most likely to regress quietly.
+///
+/// PRESERVING THE EXISTING BEHAVIOUR IS THE POINT. Before a picker existed the
+/// client sent no product at all and ws_record_delivery resolved the
+/// organization's default bottle-type product server-side. Defaulting the field
+/// to that same product means an untouched save posts exactly what it always
+/// did; the picker only matters when someone deliberately changes it.
+///
+/// [defaultProductId] is what fetchDefaultProductId() returned, which is null
+/// when no active product sits on the default bottle type.
+int? wsPreselectedProductId(
+  List<Map<String, dynamic>> products,
+  int? defaultProductId,
+) {
+  if (products.isEmpty) return null;
+
+  int? idOf(Map<String, dynamic> row) => (row['productid'] as num?)?.toInt();
+
+  // Only honour the default if it is actually in the list. A product that has
+  // been deactivated since is not selectable, and pinning the field to an id
+  // with no matching item would render as blank-but-set.
+  if (defaultProductId != null &&
+      products.any((r) => idOf(r) == defaultProductId)) {
+    return defaultProductId;
+  }
+
+  // Exactly one choice is not a choice. Anything else is left unselected so
+  // the driver makes a deliberate pick rather than inheriting whatever sorted
+  // first — which is the bug the customer dropdown used to have.
+  if (products.length == 1) return idOf(products.single);
+
+  return null;
+}
+
+/// Whether Save may proceed, product-wise.
+///
+/// Required ONLY when the organization actually has products. An organization
+/// still being set up has none, and blocking Save there would turn a missing
+/// picker into a total inability to record a delivery — a worse bug than the
+/// one being fixed. With no products the server still resolves its own default,
+/// exactly as it did before this screen had a picker.
+bool wsProductSelectionValid(
+  List<Map<String, dynamic>> products,
+  int? selectedProductId,
+) =>
+    products.isEmpty || selectedProductId != null;
+
 class WsDeliveryScreen extends StatefulWidget {
   final WsCustomer? preselectedCustomer;
   const WsDeliveryScreen({super.key, this.preselectedCustomer});
@@ -34,6 +84,22 @@ class _WsDeliveryScreenState extends State<WsDeliveryScreen> {
   WsPaymentMethod       _payMethod = WsPaymentMethod.cash;
   DateTime              _date      = DateTime.now();
   bool                  _loading   = false;
+
+  /// WHAT is being delivered.
+  ///
+  /// Rows exactly as fetchProducts() returns them — org-scoped, active only,
+  /// ordered by name. RLS (`products_select`) restricts the read to the
+  /// caller's own organization, so another tenant's product cannot appear here
+  /// to be picked in the first place.
+  List<Map<String, dynamic>> _products = const [];
+
+  /// The selected productid, NOT the row.
+  ///
+  /// Typed on int deliberately: DropdownButtonFormField compares its value to
+  /// each item's value with ==, and Map has no value equality in Dart. Keying
+  /// the dropdown on the row Map would leave the field looking permanently
+  /// unselected the moment the list is refetched.
+  int? _selProductId;
 
   /// The idempotency key for the delivery currently being entered.
   ///
@@ -100,12 +166,46 @@ class _WsDeliveryScreenState extends State<WsDeliveryScreen> {
     //
     // _staff was declared but never populated, so the "delivered by" dropdown
     // was permanently empty and every delivery was saved with a null driver.
-    final staff = await WsDataService.fetchStaff();
+    // GUARDED, and awaited-with-a-catch rather than left to throw.
+    //
+    // _load() is called from initState as a bare `_load();` — no await, no
+    // catch — so an exception here became an unhandled async error rather than
+    // anything the user could see. Offline, before the staff cache existed,
+    // that happened every time.
+    //
+    // An empty list is honest: the "delivered by" dropdown disables itself and
+    // says so, exactly as the product picker already does. Refusing to open the
+    // screen would be worse.
+    var staff = const <WsInternalUser>[];
+    try {
+      staff = await WsDataService.fetchStaff();
+    } catch (e) {
+      debugPrint('delivery: could not load staff — $e');
+    }
+
+    // Products, unlike customers, are a SHORT list — an organization sells a
+    // handful of things — so a dropdown is right here where it was wrong for
+    // customers, and no lookup service is warranted.
+    //
+    // Failing to load them must not stop a delivery being recorded. With an
+    // empty list the field is disabled, validation does not demand a choice,
+    // and the server resolves its own default exactly as before.
+    var products = const <Map<String, dynamic>>[];
+    int? defaultProductId;
+    try {
+      products = await WsDataService.fetchProducts();
+      defaultProductId = await WsDataService.fetchDefaultProductId();
+    } catch (_) {
+      // Left empty on purpose. See above.
+    }
+
     if (!mounted) return;
     setState(() {
-      _staff       = staff;
-      _selCustomer = widget.preselectedCustomer;
-      _selStaff    = staff.isNotEmpty ? staff.first : null;
+      _staff        = staff;
+      _selCustomer  = widget.preselectedCustomer;
+      _selStaff     = staff.isNotEmpty ? staff.first : null;
+      _products     = products;
+      _selProductId = wsPreselectedProductId(products, defaultProductId);
     });
     await _refreshRate();
   }
@@ -151,7 +251,25 @@ class _WsDeliveryScreenState extends State<WsDeliveryScreen> {
     final c = _selCustomer;
     if (c == null) return;
     try {
-      final rate = await WsDataService.resolveDefaultRate(c.customerId, on: _date);
+      // PRICE THE PRODUCT THAT IS ACTUALLY SELECTED.
+      //
+      // This previously always called resolveDefaultRate, which prices the
+      // organization's DEFAULT product. Now that a driver can pick something
+      // else, that would preview one product's price and invoice another's —
+      // ws.resolve_price is per-product, and the schema's own pricing code
+      // warns about exactly this ("would bill a case of 500ml at the 19L water
+      // rate").
+      //
+      // With nothing selected it falls back to the previous call, so the
+      // no-products and still-loading cases behave as they always did.
+      final p = _selProductId;
+      final rate = p == null
+          ? await WsDataService.resolveDefaultRate(c.customerId, on: _date)
+          : await WsDataService.resolvePrice(
+              productId: p,
+              customerId: c.customerId,
+              on: _date,
+            );
       if (!mounted) return;
       setState(() => _resolvedRate = rate > 0 ? rate : null);
     } catch (_) {
@@ -172,6 +290,17 @@ class _WsDeliveryScreenState extends State<WsDeliveryScreen> {
   /// and the journal entries, so none of those are sent from here.
   Future<void> _save() async {
     if (!_form.currentState!.validate() || _selCustomer == null) return;
+
+    // Says why, rather than returning silently. A Save button that does nothing
+    // and explains nothing is the same defect as Add Customer with no area.
+    if (!wsProductSelectionValid(_products, _selProductId)) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('Select a product before saving.'),
+        backgroundColor: WsColors.red,
+      ));
+      return;
+    }
+
     setState(() => _loading = true);
 
     // Capture before the first await: using context across an async gap is
@@ -232,6 +361,9 @@ class _WsDeliveryScreenState extends State<WsDeliveryScreen> {
           date: _date,
           delivered: _deliveredInt,
           returned: _returnedInt,
+          // Null stays legitimate: the server resolves the organization's
+          // default bottle-type product, which is the pre-picker behaviour.
+          productId: _selProductId,
           amountPaid: payAmt,
           paymentMethod: _payMethod.name,
           deliveredById: _selStaff?.internalUserId,
@@ -268,6 +400,11 @@ class _WsDeliveryScreenState extends State<WsDeliveryScreen> {
         deliveryDate: _date,
         delivered: _deliveredInt,
         returned: _returnedInt,
+        // CAPTURED AT SAVE TIME, like the store, the key and the position.
+        // It goes into the queued payload and is replayed unchanged, so
+        // changing the picker afterwards cannot alter a document already
+        // queued — and a retry posts the same product it was saved with.
+        productId: _selProductId,
         amountPaid: payAmt,
         paymentMethod: _payMethod.name,
         deliveredById: _selStaff?.internalUserId,
@@ -349,6 +486,40 @@ class _WsDeliveryScreenState extends State<WsDeliveryScreen> {
             value: _customerPick,
             search: WsLookupService.customers,
             onSelected: _pickCustomer,
+          ),
+          const SizedBox(height: 16),
+          const Text('Product', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: WsColors.text2)),
+          const SizedBox(height: 6),
+          // Keyed on productid, not on the row — see _selProductId.
+          //
+          // Only this organization's active products can appear: fetchProducts
+          // filters on orgid and isactive, and the products_select RLS policy
+          // makes reading another tenant's rows impossible regardless. The
+          // database is the real guard — ws.tg_deliverydetail_prepare raises
+          // 23514 on a cross-tenant productid — so this list is a convenience,
+          // not the security boundary.
+          DropdownButtonFormField<int>(
+            initialValue: _selProductId,
+            decoration: InputDecoration(
+              hintText: _products.isEmpty
+                  ? 'No products configured'
+                  : 'Select product',
+            ),
+            items: _products.map((r) {
+              final id    = (r['productid'] as num).toInt();
+              final name  = '${r['productname'] ?? ''}'.trim();
+              final unit  = '${r['unitlabel'] ?? ''}'.trim();
+              final label = unit.isEmpty || unit == name ? name : '$name · $unit';
+              return DropdownMenuItem(value: id, child: Text(label));
+            }).toList(),
+            onChanged: _products.isEmpty
+                ? null
+                : (id) {
+                    setState(() => _selProductId = id);
+                    // The price is per-product, so the preview has to follow
+                    // the selection or it contradicts the invoice.
+                    _refreshRate();
+                  },
           ),
           const SizedBox(height: 16),
           const Text('Date', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: WsColors.text2)),

@@ -31,6 +31,13 @@ abstract class WsOutboxStore {
   Future<List<Map<String, dynamic>>> load();
   Future<void> save(List<Map<String, dynamic>> items);
 
+  /// Drop storage belonging to instances that are finished with.
+  ///
+  /// Only meaningful for a store that keeps one key per instance; the default
+  /// does nothing, so single-key implementations are unaffected. Never removes
+  /// anything holding pending, syncing or failed work.
+  Future<int> collectGarbage(Duration keepSyncedFor) async => 0;
+
   /// Wipe everything. Used by tests and by "sign out and forget this device".
   Future<void> clear();
 
@@ -236,6 +243,11 @@ class WsOutboxFileStore implements WsOutboxStore {
     if (await file.exists()) await file.delete();
     if (await _tmp.exists()) await _tmp.delete();
   }
+
+  /// Single-key store: there are no other instances' keys to collect.
+  @override
+  Future<int> collectGarbage(Duration keepSyncedFor) async => 0;
+
 }
 
 /// In-memory store, for tests and for a "do not persist" mode.
@@ -256,4 +268,8 @@ class WsOutboxMemoryStore implements WsOutboxStore {
 
   @override
   Future<void> clear() async => _items = [];
+
+  /// Single-key store: there are no other instances' keys to collect.
+  @override
+  Future<int> collectGarbage(Duration keepSyncedFor) async => 0;
 }

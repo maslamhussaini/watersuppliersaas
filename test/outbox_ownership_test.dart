@@ -61,10 +61,26 @@ void main() {
       );
 
   /// The stored JSON, as a browser reload would find it.
+  ///
+  /// Reads every `outbox.instance.*` key rather than the single `outbox.queue`
+  /// that used to hold everything. The queue moved to one key per instance for
+  /// Defect #7 (two tabs overwriting each other), so this probe follows it —
+  /// what is being observed is unchanged, only where it lives.
+  ///
+  /// Deliberately CONCATENATES instead of merging: a probe that merged would
+  /// hide a duplicate, and several assertions below rely on `.single` to prove
+  /// exactly one record exists.
   Future<List<Map<String, dynamic>>> stored() async {
-    final raw = await kv.read('outbox.queue');
-    if (raw == null) return [];
-    return (jsonDecode(raw) as List).cast<Map<String, dynamic>>();
+    final rows = <Map<String, dynamic>>[];
+    for (final key in (await kv.keys())..sort()) {
+      if (!key.startsWith('outbox.instance.') || key.endsWith('.corrupt')) {
+        continue;
+      }
+      final raw = await kv.read(key);
+      if (raw == null) continue;
+      rows.addAll((jsonDecode(raw) as List).cast<Map<String, dynamic>>());
+    }
+    return rows;
   }
 
   // ═══ CAPTURE ══════════════════════════════════════════════════════════════
@@ -328,8 +344,20 @@ void main() {
         store: WsOutboxKvStore(kv),
         currentUserId: () => signedIn,
         poster: (item) async {
-          final raw = await kv.read('outbox.queue');
-          final rows = (jsonDecode(raw!) as List).cast<Map<String, dynamic>>();
+          // Same probe as stored(), inline because this one runs mid-post:
+          // the point is that the adoption is already durable BEFORE the
+          // network is touched.
+          final rows = <Map<String, dynamic>>[];
+          for (final key in (await kv.keys())..sort()) {
+            if (!key.startsWith('outbox.instance.') ||
+                key.endsWith('.corrupt')) {
+              continue;
+            }
+            final raw = await kv.read(key);
+            if (raw != null) {
+              rows.addAll((jsonDecode(raw) as List).cast<Map<String, dynamic>>());
+            }
+          }
           ownerOnDiskWhenPosting = rows.first['authUserId'] as String?;
           return const WsPostResult.success(documentId: 1);
         },

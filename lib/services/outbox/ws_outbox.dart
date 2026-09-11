@@ -148,6 +148,24 @@ class WsPostResult {
 /// which the queue touches the network.
 typedef WsOutboxPoster = Future<WsPostResult> Function(WsOutboxItem item);
 
+/// Total order for the queue.
+///
+/// seq alone is no longer sufficient. Since Defect #7 each instance assigns seq
+/// from its own view, so two tabs can independently mint the same number. A
+/// non-total comparator leaves those two items in arbitrary relative order, and
+/// seq's own contract says ordering matters "because a later document may
+/// depend on it".
+///
+/// createdAt then clientUuid break the tie deterministically. Single-tab queues
+/// are unaffected: seq is already unique there, so the tiebreaks never run.
+int wsOutboxOrder(WsOutboxItem a, WsOutboxItem b) {
+  final s = a.seq.compareTo(b.seq);
+  if (s != 0) return s;
+  final t = a.createdAt.compareTo(b.createdAt);
+  if (t != 0) return t;
+  return a.clientUuid.compareTo(b.clientUuid);
+}
+
 // ─── One queued operation ─────────────────────────────────────────────────────
 
 class WsOutboxItem {
@@ -352,7 +370,7 @@ class WsOutbox {
     final raw = await store.load();
     _loadIssue = store.lastLoadIssue;
     _items = raw.map(WsOutboxItem.fromJson).toList()
-      ..sort((a, b) => a.seq.compareTo(b.seq));
+      ..sort(wsOutboxOrder);
 
     // CRASH RECOVERY.
     //
@@ -382,6 +400,7 @@ class WsOutbox {
     await store.save(_items.map((e) => e.toJson()).toList());
     if (!_changes.isClosed) _changes.add(null);
   }
+
 
   // ── Reading ──────────────────────────────────────────────────────────────
 
@@ -603,7 +622,7 @@ class WsOutbox {
               // there is nothing wrong with it.
               (uid == null || e.authUserId == uid))
           .toList()
-        ..sort((a, b) => a.seq.compareTo(b.seq));
+        ..sort(wsOutboxOrder);
 
       for (final item in queue) {
         item.status = WsOutboxStatus.syncing;
@@ -712,10 +731,17 @@ class WsOutbox {
       final tooOld = (it.syncedAt ?? it.createdAt).isBefore(cutoff);
       if (i >= keepSynced || tooOld) drop.add(it.clientUuid);
     }
-    if (drop.isEmpty) return;
+    if (drop.isEmpty) {
+      // Even when this instance has nothing to prune, other instances may have
+      // left keys behind. GC uses the SAME policy and never touches a key that
+      // still holds pending, syncing or failed work.
+      await store.collectGarbage(keepSyncedFor);
+      return;
+    }
     _items.removeWhere(
         (e) => e.status == WsOutboxStatus.synced && drop.contains(e.clientUuid));
     await _persist();
+    await store.collectGarbage(keepSyncedFor);
   }
 
   /// ONE-TIME COMPATIBILITY RULE for queues written before ownership existed.
